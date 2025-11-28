@@ -54,6 +54,9 @@ class NLLexer:
     KEYWORDS = {
         "GET",
         "INSERT",
+        "DELETE",
+        "UPDATE",
+        "FROM",
         "INTO",
         "VALUES",
         "VALUE",
@@ -173,6 +176,19 @@ class NLInsert:
 
 
 @dataclass
+class NLDelete:
+    table: str
+    where: Optional[NLCondition] = None
+
+
+@dataclass
+class NLUpdate:
+    table: str
+    assignments: List[tuple[str, str]]
+    where: Optional[NLCondition] = None
+
+
+@dataclass
 class SQLCondition:
     left: str
     operator: str
@@ -193,6 +209,19 @@ class SQLInsert:
     table: str
     columns: List[str]
     values: List[str]
+
+
+@dataclass
+class SQLDelete:
+    table: str
+    where: Optional[SQLCondition] = None
+
+
+@dataclass
+class SQLUpdate:
+    table: str
+    assignments: List[tuple[str, str]]
+    where: Optional[SQLCondition] = None
 
 
 @dataclass
@@ -217,9 +246,22 @@ class DSLInsertSpec:
     values: List[str]
 
 
-NLStatement = NLQuery | NLInsert
-DSLStatementSpec = DSLSelectSpec | DSLInsertSpec
-SQLStatement = SQLSelect | SQLInsert
+@dataclass
+class DSLDeleteSpec:
+    table: str
+    conditions: List[DSLConditionSpec]
+
+
+@dataclass
+class DSLUpdateSpec:
+    table: str
+    assignments: List[tuple[str, str]]
+    conditions: List[DSLConditionSpec]
+
+
+NLStatement = NLQuery | NLInsert | NLDelete | NLUpdate
+DSLStatementSpec = DSLSelectSpec | DSLInsertSpec | DSLDeleteSpec | DSLUpdateSpec
+SQLStatement = SQLSelect | SQLInsert | SQLDelete | SQLUpdate
 
 
 @dataclass
@@ -255,7 +297,11 @@ class LL1Parser:
                 return self._parse_select_command()
             if token.value == "INSERT":
                 return self._parse_insert_command()
-        raise ValueError("Only GET ... or INSERT ... statements are supported.")
+            if token.value == "DELETE":
+                return self._parse_delete_command()
+            if token.value == "UPDATE":
+                return self._parse_update_command()
+        raise ValueError("Only GET ..., INSERT ..., DELETE ..., or UPDATE ... statements are supported.")
 
     def _parse_select_command(self) -> NLQuery:
         self._expect_keyword("GET")
@@ -286,6 +332,38 @@ class LL1Parser:
         self._accept_optional(TokenType.PERIOD)
         self._expect(TokenType.EOF)
         return NLInsert(table_phrase, assignments)
+
+    def _parse_delete_command(self) -> NLDelete:
+        self._expect_keyword("DELETE")
+        self._match_keyword("THE")
+        while self._match_any(self.ARTICLES | {"RECORD", "RECORDS"}):
+            continue
+        if not self._lookahead_is_keyword("FROM"):
+            self._skip_until_keyword("FROM")
+        self._expect_keyword("FROM")
+        table_phrase = self._parse_table_phrase()
+        where_clause = None
+        if self._match_condition_introducer():
+            where_clause = self._parse_condition_chain()
+        self._accept_optional(TokenType.PERIOD)
+        self._expect(TokenType.EOF)
+        return NLDelete(table_phrase, where_clause)
+
+    def _parse_update_command(self) -> NLUpdate:
+        self._expect_keyword("UPDATE")
+        self._match_keyword("THE")
+        table_phrase = self._parse_table_phrase(stop_keywords=self.ASSIGNMENT_INTRODUCERS)
+        if not self._match_any(self.ASSIGNMENT_INTRODUCERS):
+            raise ValueError("Expected 'with', 'values', 'set' to introduce assignments.")
+        assignments = self._parse_assignment_list()
+        if not assignments:
+            raise ValueError("Update statements require at least one column/value pair.")
+        where_clause = None
+        if self._match_condition_introducer():
+            where_clause = self._parse_condition_chain()
+        self._accept_optional(TokenType.PERIOD)
+        self._expect(TokenType.EOF)
+        return NLUpdate(table_phrase, assignments, where_clause)
 
     def _parse_column_list(self) -> List[str]:
         items: List[List[Token]] = []
@@ -615,6 +693,10 @@ class SemanticMapper:
             return self._map_select(statement)
         if isinstance(statement, NLInsert):
             return self._map_insert(statement)
+        if isinstance(statement, NLDelete):
+            return self._map_delete(statement)
+        if isinstance(statement, NLUpdate):
+            return self._map_update(statement)
         raise TypeError(f"Unsupported NL statement: {type(statement).__name__}")
 
     def _map_select(self, query: NLQuery) -> DSLSelectSpec:
@@ -631,6 +713,21 @@ class SemanticMapper:
             values.append(self._format_literal(value_phrase))
         table = self._map_table(statement.table)
         return DSLInsertSpec(table=table, columns=columns, values=values)
+
+    def _map_delete(self, statement: NLDelete) -> DSLDeleteSpec:
+        table = self._map_table(statement.table)
+        conditions = self._map_condition_chain(statement.where)
+        return DSLDeleteSpec(table=table, conditions=conditions)
+
+    def _map_update(self, statement: NLUpdate) -> DSLUpdateSpec:
+        table = self._map_table(statement.table)
+        assignments: List[tuple[str, str]] = []
+        for column_phrase, value_phrase in statement.assignments:
+            column = self._map_column(column_phrase)
+            value = self._format_literal(value_phrase)
+            assignments.append((column, value))
+        conditions = self._map_condition_chain(statement.where)
+        return DSLUpdateSpec(table=table, assignments=assignments, conditions=conditions)
 
     def _map_column(self, phrase: str) -> str:
         normalized = _normalize(phrase)
@@ -738,8 +835,8 @@ class CodeGenerator:
     """Renders SQL AST nodes into executable SQL strings."""
 
     def generate(self, ast: SQLStatement) -> str:
-        columns = ", ".join(ast.columns) if ast.columns else "*"
         if isinstance(ast, SQLSelect):
+            columns = ", ".join(ast.columns) if ast.columns else "*"
             sql = f"SELECT {columns} FROM {ast.table}"
             where_clause = self._render_conditions(ast.where)
             if where_clause:
@@ -751,6 +848,19 @@ class CodeGenerator:
             if columns_clause:
                 return f"INSERT INTO {ast.table} {columns_clause} VALUES ({values_clause});"
             return f"INSERT INTO {ast.table} VALUES ({values_clause});"
+        if isinstance(ast, SQLDelete):
+            sql = f"DELETE FROM {ast.table}"
+            where_clause = self._render_conditions(ast.where)
+            if where_clause:
+                sql += f" WHERE {where_clause}"
+            return sql + ";"
+        if isinstance(ast, SQLUpdate):
+            set_clause = ", ".join(f"{col} = {val}" for col, val in ast.assignments)
+            sql = f"UPDATE {ast.table} SET {set_clause}"
+            where_clause = self._render_conditions(ast.where)
+            if where_clause:
+                sql += f" WHERE {where_clause}"
+            return sql + ";"
         raise TypeError(f"Unsupported SQL AST node: {type(ast).__name__}")
 
     def _render_conditions(self, condition: Optional[SQLCondition]) -> str:
@@ -779,6 +889,10 @@ class DSLBuilder:
             return self._render_select(spec)
         if isinstance(spec, DSLInsertSpec):
             return self._render_insert(spec)
+        if isinstance(spec, DSLDeleteSpec):
+            return self._render_delete(spec)
+        if isinstance(spec, DSLUpdateSpec):
+            return self._render_update(spec)
         raise TypeError(f"Unsupported DSL spec: {type(spec).__name__}")
 
     def _render_select(self, spec: DSLSelectSpec) -> str:
@@ -794,6 +908,26 @@ class DSLBuilder:
         tokens.extend(self._render_identifiers(spec.columns))
         tokens.append("VALUES")
         tokens.extend(self._render_literals(spec.values))
+        return " ".join(tokens)
+
+    def _render_delete(self, spec: DSLDeleteSpec) -> str:
+        tokens: List[str] = ["DELETE", "TABLE", spec.table]
+        if spec.conditions:
+            tokens.append("WHERE")
+            tokens.extend(self._render_conditions(spec.conditions))
+        return " ".join(tokens)
+
+    def _render_update(self, spec: DSLUpdateSpec) -> str:
+        tokens: List[str] = ["UPDATE", "TABLE", spec.table, "SET"]
+        assignment_tokens: List[str] = []
+        for index, (column, value) in enumerate(spec.assignments):
+            if index:
+                assignment_tokens.append(",")
+            assignment_tokens.extend([column, "=", value])
+        tokens.extend(assignment_tokens)
+        if spec.conditions:
+            tokens.append("WHERE")
+            tokens.extend(self._render_conditions(spec.conditions))
         return " ".join(tokens)
 
     def _render_identifiers(self, identifiers: Sequence[str]) -> List[str]:
@@ -840,6 +974,9 @@ class DSLTokenizer:
         "COLUMNS",
         "WHERE",
         "INSERT",
+        "DELETE",
+        "UPDATE",
+        "SET",
         "VALUES",
         "AND",
         "OR",
@@ -1152,7 +1289,7 @@ class DSLParser:
     def parse(self, source: str) -> SQLStatement:
         tokens = DSLTokenizer(source).tokenize()
         result = self.engine.parse(tokens)
-        if not isinstance(result, (SQLSelect, SQLInsert)):
+        if not isinstance(result, (SQLSelect, SQLInsert, SQLDelete, SQLUpdate)):
             raise ValueError("DSL parsing did not produce a SQL statement.")
         return result
 
@@ -1183,6 +1320,16 @@ class DSLParser:
         add(
             "Statement",
             ("InsertStmt",),
+            lambda values: values[0],
+        )
+        add(
+            "Statement",
+            ("DeleteStmt",),
+            lambda values: values[0],
+        )
+        add(
+            "Statement",
+            ("UpdateStmt",),
             lambda values: values[0],
         )
         add(
@@ -1303,6 +1450,33 @@ class DSLParser:
             ("Literal",),
             lambda values: [values[0]],
         )
+        add(
+            "DeleteStmt",
+            ("DELETE", "TABLE", "IDENT", "WhereOpt"),
+            lambda values: SQLDelete(
+                table=values[2].value,
+                where=conditions_to_chain(values[3]),
+            ),
+        )
+        add(
+            "UpdateStmt",
+            ("UPDATE", "TABLE", "IDENT", "SET", "AssignmentSeq", "WhereOpt"),
+            lambda values: SQLUpdate(
+                table=values[2].value,
+                assignments=values[4],
+                where=conditions_to_chain(values[5]),
+            ),
+        )
+        add(
+            "AssignmentSeq",
+            ("AssignmentSeq", "COMMA", "IDENT", "EQUAL", "Literal"),
+            lambda values: values[0] + [(values[2].value, values[4])],
+        )
+        add(
+            "AssignmentSeq",
+            ("IDENT", "EQUAL", "Literal"),
+            lambda values: [(values[0].value, values[2])],
+        )
 
         return Grammar(start_symbol="Statement", productions=productions)
 
@@ -1400,22 +1574,39 @@ class NLToSQLCompiler:
 def main() -> None:
     compiler = NLToSQLCompiler()
     print("Natural Language → SQL compiler\n")
+    print("Available SQL Syntax:")
+    print("  - SELECT: Get data from tables")
+    print("  - INSERT: Add new records to tables")
+    print("  - DELETE: Remove records from tables")
+    print("  - UPDATE: Modify existing records in tables\n")
     print("How to use:")
     print("  1. Type an English request such as:")
     print("       Get the names and emails of customers who live in Jakarta.")
     print("       Insert a new record into customers with name Sarah and status Active.")
+    print("       Delete the records from customers who live in Jakarta.")
+    print("       Update the customers with status Active where city is Jakarta.")
     print("  2. Press Enter to compile it into SQL.\n")
     select_example = "Get the names and emails of customers who live in Jakarta."
     insert_example = "Insert a new record into customers with name Sarah and status Active."
+    delete_example = "Delete the records from customers who live in Jakarta."
+    update_example = "Update the customers with status Active where city is Jakarta."
     print("Examples:")
     select_artifacts = compiler.compile_with_artifacts(select_example)
     insert_artifacts = compiler.compile_with_artifacts(insert_example)
+    delete_artifacts = compiler.compile_with_artifacts(delete_example)
+    update_artifacts = compiler.compile_with_artifacts(update_example)
     print(f"  NL : {select_example}")
     print(f"  DSL: {select_artifacts.dsl}")
     print(f"  SQL: {select_artifacts.sql}\n")
     print(f"  NL : {insert_example}")
     print(f"  DSL: {insert_artifacts.dsl}")
     print(f"  SQL: {insert_artifacts.sql}\n")
+    print(f"  NL : {delete_example}")
+    print(f"  DSL: {delete_artifacts.dsl}")
+    print(f"  SQL: {delete_artifacts.sql}\n")
+    print(f"  NL : {update_example}")
+    print(f"  DSL: {update_artifacts.dsl}")
+    print(f"  SQL: {update_artifacts.sql}\n")
     print("Enter natural-language requests (blank line exits):\n")
 
     try:
