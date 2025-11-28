@@ -10,7 +10,9 @@ explicit so the flow is easy to follow and extend:
 2. Parser (LL(1))   – produces an abstract syntax tree (AST) for the NL query.
 3. Semantic Mapping – uses a systematic mapping table + patterns to interpret
                       business terminology as concrete SQL schema elements.
-4. Code Generator   – renders the interpreted AST into executable SQL.
+4. DSL Builder      – emits a compact DSL that captures the interpreted intent.
+5. LALR Parser      – validates DSL and rehydrates an executable SQL AST.
+6. Code Generator   – renders the final AST into executable SQL.
 
 The implementation is intentionally compact yet showcases how compiler ideas
 apply outside traditional programming languages.
@@ -18,9 +20,11 @@ apply outside traditional programming languages.
 
 from __future__ import annotations
 
+import difflib
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 # --------------------------------------------------------------------------- #
@@ -191,8 +195,38 @@ class SQLInsert:
     values: List[str]
 
 
+@dataclass
+class DSLConditionSpec:
+    column: str
+    operator: str
+    literal: str
+    connector: Optional[str] = None
+
+
+@dataclass
+class DSLSelectSpec:
+    columns: List[str]
+    table: str
+    conditions: List[DSLConditionSpec]
+
+
+@dataclass
+class DSLInsertSpec:
+    table: str
+    columns: List[str]
+    values: List[str]
+
+
 NLStatement = NLQuery | NLInsert
+DSLStatementSpec = DSLSelectSpec | DSLInsertSpec
 SQLStatement = SQLSelect | SQLInsert
+
+
+@dataclass
+class CompilerArtifacts:
+    sql: str
+    dsl: str
+    recommendations: List[str]
 
 
 # --------------------------------------------------------------------------- #
@@ -576,27 +610,27 @@ class SemanticMapper:
         self.mapping = mapping_table
         self.attribute_patterns = attribute_patterns
 
-    def map(self, statement: NLStatement) -> SQLStatement:
+    def map(self, statement: NLStatement) -> DSLStatementSpec:
         if isinstance(statement, NLQuery):
             return self._map_select(statement)
         if isinstance(statement, NLInsert):
             return self._map_insert(statement)
         raise TypeError(f"Unsupported NL statement: {type(statement).__name__}")
 
-    def _map_select(self, query: NLQuery) -> SQLSelect:
+    def _map_select(self, query: NLQuery) -> DSLSelectSpec:
         columns = [self._map_column(col) for col in query.columns] or ["*"]
         table = self._map_table(query.table)
-        where = self._map_condition_chain(query.where)
-        return SQLSelect(columns, table, where)
+        conditions = self._map_condition_chain(query.where)
+        return DSLSelectSpec(columns=columns, table=table, conditions=conditions)
 
-    def _map_insert(self, statement: NLInsert) -> SQLInsert:
+    def _map_insert(self, statement: NLInsert) -> DSLInsertSpec:
         columns: List[str] = []
         values: List[str] = []
         for column_phrase, value_phrase in statement.assignments:
             columns.append(self._map_column(column_phrase))
             values.append(self._format_literal(value_phrase))
         table = self._map_table(statement.table)
-        return SQLInsert(table=table, columns=columns, values=values)
+        return DSLInsertSpec(table=table, columns=columns, values=values)
 
     def _map_column(self, phrase: str) -> str:
         normalized = _normalize(phrase)
@@ -613,21 +647,18 @@ class SemanticMapper:
         words = normalized.split()
         return "".join(word.capitalize() for word in words) or "Table"
 
-    def _map_condition_chain(self, condition: Optional[NLCondition]) -> Optional[SQLCondition]:
-        if not condition:
-            return None
-        head = self._map_single_condition(condition)
-        current_sql = head
-        current_nl = condition
-        while current_nl.next_condition:
-            current_sql.connector = current_nl.connector
-            next_sql = self._map_single_condition(current_nl.next_condition)
-            current_sql.next_condition = next_sql
-            current_sql = next_sql
-            current_nl = current_nl.next_condition
-        return head
+    def _map_condition_chain(self, condition: Optional[NLCondition]) -> List[DSLConditionSpec]:
+        specs: List[DSLConditionSpec] = []
+        current = condition
+        while current:
+            spec = self._map_single_condition(current)
+            specs.append(spec)
+            if current.connector and current.next_condition:
+                spec.connector = current.connector
+            current = current.next_condition
+        return specs
 
-    def _map_single_condition(self, condition: NLCondition) -> SQLCondition:
+    def _map_single_condition(self, condition: NLCondition) -> DSLConditionSpec:
         value = self._match_attribute(condition.words)
         if not value:
             value = self._fallback_condition(condition.words)
@@ -635,7 +666,7 @@ class SemanticMapper:
             text = " ".join(condition.words)
             raise ValueError(f"Unable to interpret condition '{text}'.")
         column, operator, literal = value
-        return SQLCondition(column, operator, literal)
+        return DSLConditionSpec(column=column, operator=operator, literal=literal)
 
     def _match_attribute(self, words: Sequence[str]) -> Optional[tuple[str, str, str]]:
         for pattern in self.attribute_patterns:
@@ -736,6 +767,589 @@ class CodeGenerator:
 
 
 # --------------------------------------------------------------------------- #
+# DSL Builder + LALR Parser
+# --------------------------------------------------------------------------- #
+
+
+class DSLBuilder:
+    """Produces a deterministic DSL representation from interpreted NL statements."""
+
+    def build(self, spec: DSLStatementSpec) -> str:
+        if isinstance(spec, DSLSelectSpec):
+            return self._render_select(spec)
+        if isinstance(spec, DSLInsertSpec):
+            return self._render_insert(spec)
+        raise TypeError(f"Unsupported DSL spec: {type(spec).__name__}")
+
+    def _render_select(self, spec: DSLSelectSpec) -> str:
+        tokens: List[str] = ["SELECT", "TABLE", spec.table, "COLUMNS"]
+        tokens.extend(self._render_identifiers(spec.columns or ["*"]))
+        if spec.conditions:
+            tokens.append("WHERE")
+            tokens.extend(self._render_conditions(spec.conditions))
+        return " ".join(tokens)
+
+    def _render_insert(self, spec: DSLInsertSpec) -> str:
+        tokens: List[str] = ["INSERT", "TABLE", spec.table, "COLUMNS"]
+        tokens.extend(self._render_identifiers(spec.columns))
+        tokens.append("VALUES")
+        tokens.extend(self._render_literals(spec.values))
+        return " ".join(tokens)
+
+    def _render_identifiers(self, identifiers: Sequence[str]) -> List[str]:
+        if not identifiers:
+            return []
+        if len(identifiers) == 1 and identifiers[0] == "*":
+            return ["*"]
+        tokens: List[str] = []
+        for index, name in enumerate(identifiers):
+            if index:
+                tokens.append(",")
+            tokens.append(name)
+        return tokens
+
+    def _render_literals(self, values: Sequence[str]) -> List[str]:
+        tokens: List[str] = []
+        for index, value in enumerate(values):
+            if index:
+                tokens.append(",")
+            tokens.append(value)
+        return tokens
+
+    def _render_conditions(self, conditions: Sequence[DSLConditionSpec]) -> List[str]:
+        tokens: List[str] = []
+        for index, condition in enumerate(conditions):
+            tokens.extend([condition.column, condition.operator, condition.literal])
+            if condition.connector and index < len(conditions) - 1:
+                tokens.append(condition.connector)
+        return tokens
+
+
+@dataclass(frozen=True)
+class DSLToken:
+    type: str
+    value: str
+
+
+class DSLTokenizer:
+    """Tokenizes the DSL emitted by :class:`DSLBuilder`."""
+
+    KEYWORDS = {
+        "SELECT",
+        "TABLE",
+        "COLUMNS",
+        "WHERE",
+        "INSERT",
+        "VALUES",
+        "AND",
+        "OR",
+    }
+    SIMPLE_TOKENS = {
+        ",": "COMMA",
+        "(": "LPAREN",
+        ")": "RPAREN",
+        "=": "EQUAL",
+        ">": "GT",
+        "<": "LT",
+    }
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.position = 0
+
+    def tokenize(self) -> List[DSLToken]:
+        tokens: List[DSLToken] = []
+        while self.position < len(self.source):
+            char = self.source[self.position]
+            if char.isspace():
+                self.position += 1
+                continue
+            if char in self.SIMPLE_TOKENS:
+                tokens.append(DSLToken(self.SIMPLE_TOKENS[char], char))
+                self.position += 1
+                continue
+            if char == "*":
+                tokens.append(DSLToken("STAR", "*"))
+                self.position += 1
+                continue
+            if char in {"'", '"'}:
+                tokens.append(self._consume_string(char))
+                continue
+            if char.isdigit():
+                tokens.append(self._consume_number())
+                continue
+            if char.isalpha() or char == "_":
+                tokens.append(self._consume_word())
+                continue
+            raise ValueError(f"Unexpected DSL character '{char}' at {self.position}.")
+        tokens.append(DSLToken("$", ""))
+        return tokens
+
+    def _consume_word(self) -> DSLToken:
+        start = self.position
+        while self.position < len(self.source) and (
+            self.source[self.position].isalnum() or self.source[self.position] == "_"
+        ):
+            self.position += 1
+        word = self.source[start : self.position]
+        upper_word = word.upper()
+        if upper_word in self.KEYWORDS:
+            return DSLToken(upper_word, upper_word)
+        return DSLToken("IDENT", word)
+
+    def _consume_number(self) -> DSLToken:
+        start = self.position
+        while self.position < len(self.source) and (
+            self.source[self.position].isdigit() or self.source[self.position] == "."
+        ):
+            self.position += 1
+        return DSLToken("NUMBER", self.source[start : self.position])
+
+    def _consume_string(self, quote: str) -> DSLToken:
+        self.position += 1
+        start = self.position
+        literal: List[str] = []
+        while self.position < len(self.source):
+            char = self.source[self.position]
+            if char == quote:
+                literal.append(self.source[start : self.position])
+                self.position += 1
+                value = quote + "".join(literal) + quote
+                return DSLToken("STRING", value)
+            self.position += 1
+        raise ValueError("Unterminated DSL string literal.")
+
+
+@dataclass(frozen=True)
+class Production:
+    head: str
+    body: Tuple[str, ...]
+    action: Callable[[Sequence[object]], object]
+
+
+@dataclass(frozen=True)
+class LR1Item:
+    production_index: int
+    position: int
+    lookahead: str
+
+    def core(self) -> Tuple[int, int]:
+        return (self.production_index, self.position)
+
+
+@dataclass
+class Grammar:
+    start_symbol: str
+    productions: List[Production]
+
+
+class LALRParserEngine:
+    """Constructs and executes a compact LALR(1) parser."""
+
+    EPSILON = "__ε__"
+
+    def __init__(self, grammar: Grammar) -> None:
+        self.grammar = grammar
+        self.productions = [Production("$S'", (grammar.start_symbol,), lambda values: values[0])] + grammar.productions
+        self.non_terminals = {prod.head for prod in self.productions}
+        self.terminals = self._compute_terminals()
+        self.first_sets = self._compute_first_sets()
+        canonical_states, transitions = self._build_canonical_lr1_states()
+        self.states, self.transitions = self._merge_states(canonical_states, transitions)
+        self.action_table, self.goto_table = self._build_parse_tables()
+
+    def parse(self, tokens: Sequence[DSLToken]) -> object:
+        stack: List[int] = [0]
+        values: List[object] = []
+        index = 0
+        while True:
+            state = stack[-1]
+            token = tokens[index]
+            action = self.action_table.get(state, {}).get(token.type)
+            if not action:
+                raise ValueError(f"Unexpected token {token.type}('{token.value}') at DSL position {index}.")
+            kind, target = action
+            if kind == "shift":
+                stack.append(target)
+                values.append(token)
+                index += 1
+            elif kind == "reduce":
+                production = self.productions[target]
+                body_len = len(production.body)
+                reduction_values = values[-body_len:] if body_len else []
+                if body_len:
+                    del values[-body_len:]
+                    del stack[-body_len:]
+                result = production.action(reduction_values)
+                goto_state = self.goto_table.get(stack[-1], {}).get(production.head)
+                if goto_state is None:
+                    raise ValueError(f"No goto state for {production.head}.")
+                stack.append(goto_state)
+                values.append(result)
+            elif kind == "accept":
+                return values[-1]
+
+    def _compute_terminals(self) -> Set[str]:
+        terminals: Set[str] = set()
+        non_terminals = {prod.head for prod in self.productions}
+        for production in self.productions:
+            for symbol in production.body:
+                if symbol and symbol not in non_terminals:
+                    terminals.add(symbol)
+        terminals.add("$")
+        return terminals
+
+    def _compute_first_sets(self) -> Dict[str, Set[str]]:
+        first: Dict[str, Set[str]] = {symbol: {symbol} for symbol in self.terminals}
+        for non_terminal in self.non_terminals:
+            first[non_terminal] = set()
+        updated = True
+        while updated:
+            updated = False
+            for production in self.productions:
+                head_first = first[production.head]
+                before_size = len(head_first)
+                sequence_first = self._first_of_sequence(production.body, first)
+                head_first.update(sequence_first - {self.EPSILON})
+                if self.EPSILON in sequence_first:
+                    head_first.add(self.EPSILON)
+                if len(head_first) != before_size:
+                    updated = True
+        return first
+
+    def _first_of_sequence(self, sequence: Sequence[str], first_sets: Dict[str, Set[str]]) -> Set[str]:
+        if not sequence:
+            return {self.EPSILON}
+        result: Set[str] = set()
+        for symbol in sequence:
+            symbol_first = first_sets[symbol]
+            result.update(symbol_first - {self.EPSILON})
+            if self.EPSILON not in symbol_first:
+                break
+        else:
+            result.add(self.EPSILON)
+        return result
+
+    def _closure(self, items: Set[LR1Item]) -> Set[LR1Item]:
+        closure_set = set(items)
+        added = True
+        while added:
+            added = False
+            for item in list(closure_set):
+                production = self.productions[item.production_index]
+                if item.position >= len(production.body):
+                    continue
+                symbol = production.body[item.position]
+                if symbol not in self.non_terminals:
+                    continue
+                beta = production.body[item.position + 1 :]
+                lookaheads = self._first_of_sequence(beta + (item.lookahead,), self.first_sets)
+                for idx, prod in enumerate(self.productions):
+                    if prod.head != symbol:
+                        continue
+                    for lookahead in lookaheads:
+                        if lookahead == self.EPSILON:
+                            lookahead = item.lookahead
+                        new_item = LR1Item(idx, 0, lookahead)
+                        if new_item not in closure_set:
+                            closure_set.add(new_item)
+                            added = True
+        return closure_set
+
+    def _goto(self, items: Set[LR1Item], symbol: str) -> Set[LR1Item]:
+        goto_items: Set[LR1Item] = set()
+        for item in items:
+            production = self.productions[item.production_index]
+            if item.position < len(production.body) and production.body[item.position] == symbol:
+                goto_items.add(LR1Item(item.production_index, item.position + 1, item.lookahead))
+        return self._closure(goto_items) if goto_items else set()
+
+    def _build_canonical_lr1_states(self) -> Tuple[List[Set[LR1Item]], Dict[Tuple[int, str], int]]:
+        start_item = LR1Item(0, 0, "$")
+        start_state = self._closure({start_item})
+        states: List[Set[LR1Item]] = [start_state]
+        transitions: Dict[Tuple[int, str], int] = {}
+        queue = [0]
+        while queue:
+            state_index = queue.pop()
+            state = states[state_index]
+            symbols = {symbol for item in state for symbol in self.productions[item.production_index].body[item.position : item.position + 1]}
+            for symbol in symbols:
+                target = self._goto(state, symbol)
+                if not target:
+                    continue
+                if target not in states:
+                    states.append(target)
+                    queue.append(len(states) - 1)
+                target_index = states.index(target)
+                transitions[(state_index, symbol)] = target_index
+        return states, transitions
+
+    def _merge_states(
+        self,
+        states: List[Set[LR1Item]],
+        transitions: Dict[Tuple[int, str], int],
+    ) -> Tuple[List[Set[LR1Item]], Dict[Tuple[int, str], int]]:
+        kernel_map: Dict[frozenset[Tuple[int, int]], List[int]] = {}
+        for index, state in enumerate(states):
+            kernel = frozenset(
+                item.core()
+                for item in state
+                if item.position != 0 or self.productions[item.production_index].head == "$S'"
+            )
+            kernel_map.setdefault(kernel, []).append(index)
+
+        merged_states: List[Set[LR1Item]] = []
+        old_to_new: Dict[int, int] = {}
+        for kernel_states in kernel_map.values():
+            merged: Dict[Tuple[int, int], Set[str]] = {}
+            for state_index in kernel_states:
+                for item in states[state_index]:
+                    merged.setdefault(item.core(), set()).add(item.lookahead)
+            merged_set = {
+                LR1Item(prod_idx, position, lookahead)
+                for (prod_idx, position), lookaheads in merged.items()
+                for lookahead in lookaheads
+            }
+            new_index = len(merged_states)
+            merged_states.append(merged_set)
+            for state_index in kernel_states:
+                old_to_new[state_index] = new_index
+
+        merged_transitions: Dict[Tuple[int, str], int] = {}
+        for (state_index, symbol), target in transitions.items():
+            merged_transitions[(old_to_new[state_index], symbol)] = old_to_new[target]
+        return merged_states, merged_transitions
+
+    def _build_parse_tables(self) -> Tuple[Dict[int, Dict[str, Tuple[str, int]]], Dict[int, Dict[str, int]]]:
+        action_table: Dict[int, Dict[str, Tuple[str, int]]] = {}
+        goto_table: Dict[int, Dict[str, int]] = {}
+        for state_index, state in enumerate(self.states):
+            for item in state:
+                production = self.productions[item.production_index]
+                if item.position < len(production.body):
+                    symbol = production.body[item.position]
+                    target = self.transitions.get((state_index, symbol))
+                    if symbol in self.terminals and target is not None:
+                        action_table.setdefault(state_index, {})[symbol] = ("shift", target)
+                    elif symbol in self.non_terminals and target is not None:
+                        goto_table.setdefault(state_index, {})[symbol] = target
+                else:
+                    if production.head == "$S'":
+                        action_table.setdefault(state_index, {})["$"] = ("accept", 0)
+                    else:
+                        action_table.setdefault(state_index, {})[item.lookahead] = ("reduce", item.production_index)
+        return action_table, goto_table
+
+
+class DSLParser:
+    """Parses DSL text via an automatically generated LALR parser."""
+
+    def __init__(self) -> None:
+        grammar = self._build_grammar()
+        self.engine = LALRParserEngine(grammar)
+
+    def parse(self, source: str) -> SQLStatement:
+        tokens = DSLTokenizer(source).tokenize()
+        result = self.engine.parse(tokens)
+        if not isinstance(result, (SQLSelect, SQLInsert)):
+            raise ValueError("DSL parsing did not produce a SQL statement.")
+        return result
+
+    def _build_grammar(self) -> Grammar:
+        productions: List[Production] = []
+
+        def add(head: str, body: Sequence[str], action: Callable[[Sequence[object]], object]) -> None:
+            productions.append(Production(head, tuple(body), action))
+
+        def conditions_to_chain(conditions: List[Dict[str, str]]) -> Optional[SQLCondition]:
+            if not conditions:
+                return None
+            head = SQLCondition(conditions[0]["column"], conditions[0]["operator"], conditions[0]["literal"])
+            current = head
+            for condition in conditions[1:]:
+                connector = condition.get("connector")
+                next_node = SQLCondition(condition["column"], condition["operator"], condition["literal"])
+                current.connector = connector
+                current.next_condition = next_node
+                current = next_node
+            return head
+
+        add(
+            "Statement",
+            ("SelectStmt",),
+            lambda values: values[0],
+        )
+        add(
+            "Statement",
+            ("InsertStmt",),
+            lambda values: values[0],
+        )
+        add(
+            "SelectStmt",
+            ("SELECT", "TABLE", "IDENT", "COLUMNS", "SelectColumns", "WhereOpt"),
+            lambda values: SQLSelect(
+                columns=values[4],
+                table=values[2].value,
+                where=conditions_to_chain(values[5]),
+            ),
+        )
+        add(
+            "WhereOpt",
+            ("WHERE", "ConditionList"),
+            lambda values: values[1],
+        )
+        add(
+            "WhereOpt",
+            tuple(),
+            lambda values: [],
+        )
+        add(
+            "ConditionList",
+            ("ConditionList", "Connector", "Condition"),
+            lambda values: values[0] + [dict(values[2], connector=values[1])],
+        )
+        add(
+            "ConditionList",
+            ("Condition",),
+            lambda values: [values[0]],
+        )
+        add(
+            "Condition",
+            ("IDENT", "Operator", "Literal"),
+            lambda values: {
+                "column": values[0].value,
+                "operator": values[1],
+                "literal": values[2],
+                "connector": None,
+            },
+        )
+        add(
+            "Operator",
+            ("EQUAL",),
+            lambda values: "=",
+        )
+        add(
+            "Operator",
+            ("GT",),
+            lambda values: ">",
+        )
+        add(
+            "Operator",
+            ("LT",),
+            lambda values: "<",
+        )
+        add(
+            "Connector",
+            ("AND",),
+            lambda values: values[0].value,
+        )
+        add(
+            "Connector",
+            ("OR",),
+            lambda values: values[0].value,
+        )
+        add(
+            "Literal",
+            ("STRING",),
+            lambda values: values[0].value,
+        )
+        add(
+            "Literal",
+            ("NUMBER",),
+            lambda values: values[0].value,
+        )
+        add(
+            "Literal",
+            ("IDENT",),
+            lambda values: values[0].value,
+        )
+        add(
+            "SelectColumns",
+            ("STAR",),
+            lambda values: ["*"],
+        )
+        add(
+            "SelectColumns",
+            ("ColumnSeq",),
+            lambda values: values[0],
+        )
+        add(
+            "ColumnSeq",
+            ("ColumnSeq", "COMMA", "IDENT"),
+            lambda values: values[0] + [values[2].value],
+        )
+        add(
+            "ColumnSeq",
+            ("IDENT",),
+            lambda values: [values[0].value],
+        )
+        add(
+            "InsertStmt",
+            ("INSERT", "TABLE", "IDENT", "COLUMNS", "ColumnSeq", "VALUES", "LiteralSeq"),
+            lambda values: SQLInsert(
+                table=values[2].value,
+                columns=values[4],
+                values=values[6],
+            ),
+        )
+        add(
+            "LiteralSeq",
+            ("LiteralSeq", "COMMA", "Literal"),
+            lambda values: values[0] + [values[2]],
+        )
+        add(
+            "LiteralSeq",
+            ("Literal",),
+            lambda values: [values[0]],
+        )
+
+        return Grammar(start_symbol="Statement", productions=productions)
+
+
+class QueryRecommender:
+    """Suggests replacements for unrecognised words in the NL query."""
+
+    def __init__(self, vocabulary: Iterable[str], cutoff: float = 0.78) -> None:
+        normalized_vocab = {_normalize(word): word for word in vocabulary}
+        self.vocabulary = normalized_vocab
+        self.cutoff = cutoff
+
+    def enhance(self, text: str) -> Tuple[str, List[str]]:
+        parts = re.split(r"(\W+)", text)
+        recommendations: List[str] = []
+        for index, fragment in enumerate(parts):
+            if not fragment or not fragment.strip().isalpha():
+                continue
+            normalized = _normalize(fragment)
+            if normalized in self.vocabulary:
+                parts[index] = self._preserve_case(fragment, self.vocabulary[normalized])
+                continue
+            suggestion = self._suggest_word(normalized)
+            if suggestion:
+                replacement = self._preserve_case(fragment, suggestion)
+                recommendations.append(f"Replaced '{fragment}' with '{replacement}'")
+                parts[index] = replacement
+        return "".join(parts), recommendations
+
+    def _suggest_word(self, token: str) -> Optional[str]:
+        if not token:
+            return None
+        matches = difflib.get_close_matches(token, self.vocabulary.keys(), n=1, cutoff=self.cutoff)
+        if not matches:
+            return None
+        return self.vocabulary[matches[0]]
+
+    @staticmethod
+    def _preserve_case(original: str, replacement: str) -> str:
+        if original.isupper():
+            return replacement.upper()
+        if original[0].isupper():
+            return replacement.capitalize()
+        return replacement
+
+
+# --------------------------------------------------------------------------- #
 # Facade API
 # --------------------------------------------------------------------------- #
 
@@ -744,14 +1358,38 @@ class NLToSQLCompiler:
     """Convenience façade tying all compiler phases together."""
 
     def __init__(self) -> None:
+        vocabulary = self._build_vocabulary()
+        self.recommender = QueryRecommender(vocabulary)
         self.mapper = SemanticMapper(SYSTEMATIC_MAPPING_TABLE, ATTRIBUTE_PATTERNS)
+        self.dsl_builder = DSLBuilder()
+        self.dsl_parser = DSLParser()
         self.generator = CodeGenerator()
 
     def compile(self, text: str) -> str:
-        tokens = NLLexer(text).tokenize()
+        sql, _, _ = self._run_pipeline(text)
+        return sql
+
+    def compile_with_artifacts(self, text: str) -> CompilerArtifacts:
+        sql, dsl, recommendations = self._run_pipeline(text)
+        return CompilerArtifacts(sql=sql, dsl=dsl, recommendations=recommendations)
+
+    def _run_pipeline(self, text: str) -> Tuple[str, str, List[str]]:
+        enhanced_text, recommendations = self.recommender.enhance(text)
+        tokens = NLLexer(enhanced_text).tokenize()
         statement = LL1Parser(tokens).parse()
-        sql_ast = self.mapper.map(statement)
-        return self.generator.generate(sql_ast)
+        interpretation = self.mapper.map(statement)
+        dsl_script = self.dsl_builder.build(interpretation)
+        reconstructed_ast = self.dsl_parser.parse(dsl_script)
+        sql = self.generator.generate(reconstructed_ast)
+        return sql, dsl_script, recommendations
+
+    def _build_vocabulary(self) -> Set[str]:
+        vocabulary: Set[str] = set(NLLexer.KEYWORDS)
+        for mapping in SYSTEMATIC_MAPPING_TABLE.values():
+            vocabulary.update(mapping.keys())
+            vocabulary.update(mapping.values())
+        vocabulary.update({"record", "records", "table", "tables"})
+        return vocabulary
 
 
 # --------------------------------------------------------------------------- #
@@ -770,10 +1408,14 @@ def main() -> None:
     select_example = "Get the names and emails of customers who live in Jakarta."
     insert_example = "Insert a new record into customers with name Sarah and status Active."
     print("Examples:")
+    select_artifacts = compiler.compile_with_artifacts(select_example)
+    insert_artifacts = compiler.compile_with_artifacts(insert_example)
     print(f"  NL : {select_example}")
-    print(f"  SQL: {compiler.compile(select_example)}\n")
+    print(f"  DSL: {select_artifacts.dsl}")
+    print(f"  SQL: {select_artifacts.sql}\n")
     print(f"  NL : {insert_example}")
-    print(f"  SQL: {compiler.compile(insert_example)}\n")
+    print(f"  DSL: {insert_artifacts.dsl}")
+    print(f"  SQL: {insert_artifacts.sql}\n")
     print("Enter natural-language requests (blank line exits):\n")
 
     try:
@@ -782,11 +1424,19 @@ def main() -> None:
             if not line:
                 break
             try:
-                print("SQL:", compiler.compile(line))
+                artifacts = compiler.compile_with_artifacts(line)
+                if artifacts.recommendations:
+                    print("Recommendations:")
+                    for recommendation in artifacts.recommendations:
+                        print(f"  - {recommendation}")
+                print("DSL:", artifacts.dsl)
+                print("SQL:", artifacts.sql)
             except Exception as exc:
                 print("Error:", exc)
     except EOFError:
         pass
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
 
 
 if __name__ == "__main__":
