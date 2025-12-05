@@ -79,6 +79,28 @@ class NLLexer:
         "ARE",
         "AS",
         "TO",
+        "DISTINCT",
+        "ORDER",
+        "BY",
+        "LIMIT",
+        "OFFSET",
+        "PAGE",
+        "PER",
+        "UNIQUE",
+        "LIST",
+        "SHOW",
+        "DISPLAY",
+        "SORT",
+        "SORTED",
+        "ALL",
+        "THEN",
+        "FIRST",
+        "TOP",
+        "MOST",
+        "EXPENSIVE",
+        "CHEAPEST",
+        "DESC",
+        "ASC",
     }
     PUNCTUATION = {
         ",": TokenType.COMMA,
@@ -167,6 +189,14 @@ class NLQuery:
     columns: List[str]
     table: str
     where: Optional[NLCondition] = None
+    distinct: bool = False
+    order_clauses: List[tuple[str, bool]] = None  # list of (column, is_desc)
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+
+    def __post_init__(self):
+        if self.order_clauses is None:
+            self.order_clauses = []
 
 
 @dataclass
@@ -202,6 +232,14 @@ class SQLSelect:
     columns: List[str]
     table: str
     where: Optional[SQLCondition] = None
+    distinct: bool = False
+    order_clauses: List[tuple[str, bool]] = None  # list of (column, is_desc)
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+
+    def __post_init__(self):
+        if self.order_clauses is None:
+            self.order_clauses = []
 
 
 @dataclass
@@ -237,6 +275,14 @@ class DSLSelectSpec:
     columns: List[str]
     table: str
     conditions: List[DSLConditionSpec]
+    distinct: bool = False
+    order_clauses: List[tuple[str, bool]] = None  # list of (column, is_desc)
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+
+    def __post_init__(self):
+        if self.order_clauses is None:
+            self.order_clauses = []
 
 
 @dataclass
@@ -293,7 +339,7 @@ class LL1Parser:
     def parse(self) -> NLStatement:
         token = self._lookahead()
         if token.type == TokenType.KEYWORD:
-            if token.value == "GET":
+            if token.value in {"GET", "LIST", "SHOW", "DISPLAY", "SORT", "SORTED"}:
                 return self._parse_select_command()
             if token.value == "INSERT":
                 return self._parse_insert_command()
@@ -304,17 +350,180 @@ class LL1Parser:
         raise ValueError("Only GET ..., INSERT ..., DELETE ..., or UPDATE ... statements are supported.")
 
     def _parse_select_command(self) -> NLQuery:
-        self._expect_keyword("GET")
+        # Accept several verbs that introduce a select-style request
+        verb = self._expect(TokenType.KEYWORD)
+        if verb.value not in {"GET", "LIST", "SHOW", "DISPLAY", "SORT", "SORTED"}:
+            raise ValueError(f"Expected select introducer, found {verb.value}")
+        distinct = False
+        order_clauses: List[tuple[str, bool]] = []
+        limit = None
+        offset = None
         self._match_keyword("THE")
-        columns = self._parse_column_list()
-        self._expect_keyword("OF")
-        table_phrase = self._parse_table_phrase()
-        where_clause = None
-        if self._match_condition_introducer():
-            where_clause = self._parse_condition_chain()
+        # Check for DISTINCT or UNIQUE
+        if self._match_any({"DISTINCT", "UNIQUE"}):
+            distinct = True
+
+        # Special-case forms that start with a number/page/most (e.g. "show the 5 most expensive products"
+        # or "display page 2 of customers with 20 per page"). If the next token indicates these forms,
+        # parse them with heuristics rather than a normal column list.
+        next_token = self._lookahead()
+        columns: List[str] = ["*"]
+        table_phrase: Optional[str] = None
+        where_clause: Optional[NLCondition] = None
+
+        if next_token.type == TokenType.NUMBER or (
+            next_token.type == TokenType.KEYWORD and next_token.value in {"PAGE", "MOST", "TOP", "FIRST"}
+        ):
+            # Handle LIMIT-prefixed forms
+            if next_token.type == TokenType.NUMBER:
+                limit = int(self._advance().value)
+            elif next_token.type == TokenType.KEYWORD and next_token.value == "PAGE":
+                # page N ... (we'll compute offset when we find 'per' value)
+                self._advance()
+                if self._lookahead().type == TokenType.NUMBER:
+                    page_num = int(self._advance().value)
+                else:
+                    raise ValueError("Expected page number after 'page'.")
+            else:
+                page_num = None
+
+            # Look for modifiers like MOST EXPENSIVE
+            if self._match_any({"MOST", "EXPENSIVE", "CHEAPEST", "TOP", "FIRST"}):
+                # consume any consecutive adjective keywords
+                modifiers: List[str] = []
+                while self._lookahead().type == TokenType.KEYWORD and self._lookahead().value in {
+                    "MOST",
+                    "EXPENSIVE",
+                    "CHEAPEST",
+                    "TOP",
+                    "FIRST",
+                }:
+                    modifiers.append(self._advance().value)
+                # common heuristic: 'most expensive' -> order by 'price' desc
+                if "EXPENSIVE" in modifiers or "MOST" in modifiers:
+                    order_clauses.append(("price", True))
+                if "CHEAPEST" in modifiers:
+                    order_clauses.append(("price", False))
+
+            # Parse table phrase (allow optional 'OF')
+            if self._match_keyword("OF"):
+                table_phrase = self._parse_table_phrase()
+            else:
+                table_phrase = self._parse_table_phrase()
+
+            # If we saw a 'page N' earlier and there's a trailing 'with M per page', handle it
+            if 'page_num' in locals():
+                if self._match_any({"WITH"}):
+                    if self._lookahead().type == TokenType.NUMBER:
+                        per_page = int(self._advance().value)
+                        if self._match_any({"PER"}):
+                            self._match_keyword("PAGE")
+                            limit = per_page
+                            offset = (page_num - 1) * per_page
+            columns = ["*"]
+        elif verb.value in {"SORT", "SORTED"}:
+            # SORT/SORTED can be followed by table name then BY for ordering
+            # Form: "SORT <table> BY <col> <direction>"
+            # or: "SORT <col> BY <another_col>" (less likely but possible)
+            # We'll try to parse the next identifier/phrase as a table
+            start_index = self.index
+            table_phrase = self._parse_table_phrase_for_sort_context()
+            columns = ["*"]
+            # Match optional "all" keyword that may appear between table and ORDER BY
+            self._match_any({"ALL"})
+            # Now we expect BY for the sort clause
+            if self._match_any({"BY"}):
+                order_clauses = self._parse_order_by_clause()
+            elif self._match_any({"SORTED"}):
+                # Handle "SORT table SORTED BY col" variant
+                self._expect_keyword("BY")
+                order_clauses = self._parse_order_by_clause()
+        else:
+            # Normal form: parse a column list and optionally 'of' table
+            start_index = self.index
+            try:
+                columns = self._parse_column_list()
+            except ValueError:
+                # fall back to treat as select-all and continue
+                self.index = start_index
+                columns = ["*"]
+
+            # If 'OF' present, parse table phrase, otherwise leave it None for mapper to infer
+            if self._match_keyword("OF"):
+                table_phrase = self._parse_table_phrase()
+            else:
+                table_phrase = None
+
+            if self._match_condition_introducer():
+                where_clause = self._parse_condition_chain()
+            
+            # Match optional "all" keyword that may appear between table and ORDER BY
+            self._match_any({"ALL"})
+            
+            # Check for ORDER BY with multi-column support
+            if self._match_any({"ORDER"}):
+                self._expect_keyword("BY")
+                order_clauses = self._parse_order_by_clause()
+        
+        # Check for direction phrases like "oldest to newest", "highest to lowest", "alphabetically"
+        order_clauses.extend(self._detect_order_direction_phrases(columns))
+        
+        # Check for LIMIT
+        if self._match_any({"LIMIT", "TOP", "FIRST"}):
+            limit_token = self._lookahead()
+            if limit_token.type == TokenType.NUMBER:
+                limit = int(self._advance().value)
+        # Check for OFFSET or PAGE
+        if self._match_any({"OFFSET"}):
+            offset_token = self._lookahead()
+            if offset_token.type == TokenType.NUMBER:
+                offset = int(self._advance().value)
+        elif self._match_any({"PAGE"}):
+            page_token = self._lookahead()
+            if page_token.type == TokenType.NUMBER:
+                page_num = int(self._advance().value)
+                # Look for 'PER' and number
+                if self._match_any({"PER"}):
+                    per_token = self._lookahead()
+                    if per_token.type == TokenType.NUMBER:
+                        per_page = int(self._advance().value)
+                        limit = per_page
+                        offset = (page_num - 1) * per_page
         self._accept_optional(TokenType.PERIOD)
         self._expect(TokenType.EOF)
-        return NLQuery(columns, table_phrase, where_clause)
+        return NLQuery(
+            columns,
+            table_phrase,
+            where_clause,
+            distinct=distinct,
+            order_clauses=order_clauses,
+            limit=limit,
+            offset=offset,
+        )
+
+    def _parse_table_phrase_for_sort_context(self) -> str:
+        """Parse a table name in SORT context.
+        
+        For SORT/SORTED contexts, parse table name(s) and stop at BY or other keywords.
+        """
+        self._match_keyword("THE")
+        tokens: List[Token] = []
+        while True:
+            token = self._lookahead()
+            if token.type in {TokenType.EOF, TokenType.PERIOD}:
+                break
+            if token.type == TokenType.KEYWORD and token.value in {"BY", "ORDER", "WHERE", "LIMIT", "OFFSET", "SORTED", "ALL"}:
+                break
+            if token.type == TokenType.COMMA:
+                self._advance()
+                continue
+            if token.type not in (TokenType.IDENTIFIER, TokenType.STRING, TokenType.NUMBER):
+                break
+            tokens.append(self._advance())
+        if not tokens:
+            raise ValueError("Expected a table description.")
+        return self._tokens_to_phrase(tokens)
+
 
     def _parse_insert_command(self) -> NLInsert:
         self._expect_keyword("INSERT")
@@ -371,7 +580,7 @@ class LL1Parser:
         while True:
             token = self._lookahead()
             if token.type == TokenType.EOF:
-                raise ValueError("Expected column list before end of input.")
+                break
             if token.type == TokenType.KEYWORD and token.value == "OF":
                 break
             if token.type == TokenType.COMMA or (
@@ -579,9 +788,121 @@ class LL1Parser:
             return token.value
         return None
 
+    def _parse_order_by_clause(self) -> List[tuple[str, bool]]:
+        """Parse ORDER BY clause with multi-column support.
+        
+        Returns list of (column, is_desc) tuples.
+        Recognizes forms like:
+          - ORDER BY column
+          - ORDER BY column DESC
+          - ORDER BY column ASC
+          - ORDER BY col1, col2
+          - ORDER BY col1 DESC, col2 ASC
+          - ORDER BY col1, then col2
+        """
+        order_clauses: List[tuple[str, bool]] = []
+        while True:
+            # Parse column name(s)
+            col_tokens = []
+            while True:
+                token = self._lookahead()
+                if token.type in {TokenType.EOF, TokenType.PERIOD}:
+                    break
+                if token.type == TokenType.KEYWORD and token.value in {"LIMIT", "OFFSET"}:
+                    break
+                if token.type == TokenType.COMMA:
+                    break
+                if token.type == TokenType.KEYWORD and token.value == "THEN":
+                    break
+                if token.type == TokenType.KEYWORD and token.value in {"DESC", "ASC"}:
+                    break
+                if token.type not in (TokenType.IDENTIFIER, TokenType.STRING, TokenType.NUMBER):
+                    break
+                col_tokens.append(self._advance())
+            
+            if col_tokens:
+                col_name = self._tokens_to_phrase(col_tokens)
+                is_desc = False
+                # Check for DESC/ASC modifier
+                if self._match_any({"DESC"}):
+                    is_desc = True
+                elif self._match_any({"ASC"}):
+                    is_desc = False
+                order_clauses.append((col_name, is_desc))
+            
+            # Check for comma or THEN separator (accept both)
+            if self._match_keyword("THEN"):
+                continue
+            elif self._match_keyword("COMMA"):
+                continue
+            elif self._lookahead().type == TokenType.COMMA:
+                self._advance()
+                continue
+            else:
+                break
+        
+        return order_clauses
+
+    def _detect_order_direction_phrases(self, columns: List[str]) -> List[tuple[str, bool]]:
+        """Detect and consume natural language direction phrases like 'oldest to newest', 'highest to lowest', 'alphabetically'.
+        
+        Scans and consumes tokens (until LIMIT/OFFSET/EOF) for direction indicators and maps them to
+        implicit ORDER BY clauses based on column names.
+        
+        Returns list of additional (column, is_desc) tuples to append to order_clauses.
+        """
+        additional_orders: List[tuple[str, bool]] = []
+        
+        # Scan ahead for direction keywords and collect them
+        tokens_ahead = []
+        while True:
+            token = self._lookahead()
+            if token.type in {TokenType.EOF, TokenType.PERIOD}:
+                break
+            if token.type == TokenType.KEYWORD and token.value in {"LIMIT", "OFFSET", "ORDER", "WHERE"}:
+                break
+            tokens_ahead.append(token.value.lower() if token.type == TokenType.KEYWORD else token.value)
+            self._advance()  # Actually consume the token
+        
+        text_ahead = " ".join(tokens_ahead)
+        
+        # Heuristics for direction inference
+        if "alphabetically" in text_ahead:
+            # alphabetically -> sort first column by name ASC
+            if columns and columns[0] != "*":
+                additional_orders.append((columns[0], False))
+        elif "oldest" in text_ahead and "newest" in text_ahead:
+            # "oldest to newest" -> ASC on first date-like column
+            # Infer from columns: hire_date, date_of_birth, etc.
+            for col in columns:
+                if "date" in col.lower() or "birth" in col.lower():
+                    additional_orders.append((col, False))
+                    break
+        elif "newest" in text_ahead and "oldest" in text_ahead:
+            # "newest to oldest" -> DESC
+            for col in columns:
+                if "date" in col.lower() or "birth" in col.lower():
+                    additional_orders.append((col, True))
+                    break
+        elif "highest" in text_ahead and "lowest" in text_ahead:
+            # "highest to lowest" -> DESC on numeric column
+            for col in columns:
+                if "gpa" in col.lower() or "price" in col.lower() or "amount" in col.lower():
+                    additional_orders.append((col, True))
+                    break
+        elif "lowest" in text_ahead and "highest" in text_ahead:
+            # "lowest to highest" -> ASC
+            for col in columns:
+                if "gpa" in col.lower() or "price" in col.lower() or "amount" in col.lower():
+                    additional_orders.append((col, False))
+                    break
+        
+        return additional_orders
+
     def _accept_optional(self, token_type: TokenType) -> None:
         if self._lookahead().type == token_type:
             self.index += 1
+
 
     def _tokens_to_phrase(self, tokens: Sequence[Token]) -> str:
         return " ".join(token.value for token in tokens).strip()
@@ -633,15 +954,29 @@ SYSTEMATIC_MAPPING_TABLE: Dict[str, Dict[str, str]] = {
     "columns": {
         "name": "name",
         "names": "name",
-        "customer name": "name",
-        "customer names": "name",
+        "customer name": "customer_name",
+        "customer names": "customer_name",
         "email": "email",
         "emails": "email",
         "email address": "email",
         "email addresses": "email",
+        "job title": "job_title",
+        "job titles": "job_title",
+        "product name": "product_name",
+        "product names": "product_name",
+        "price": "price",
         "phone": "phone",
         "phone number": "phone",
         "phone numbers": "phone",
+        "hire date": "hire_date",
+        "hire_date": "hire_date",
+        "gpa": "gpa",
+        "student name": "student_name",
+        "student_name": "student_name",
+        "employee name": "employee_name",
+        "employee_name": "employee_name",
+        "title": "title",
+        "author": "author",
         "all information": "*",
         "everything": "*",
     },
@@ -654,6 +989,10 @@ SYSTEMATIC_MAPPING_TABLE: Dict[str, Dict[str, str]] = {
         "orders": "Orders",
         "employee": "Employees",
         "employees": "Employees",
+        "student": "Students",
+        "students": "Students",
+        "book": "Books",
+        "books": "Books",
     },
 }
 
@@ -701,9 +1040,63 @@ class SemanticMapper:
 
     def _map_select(self, query: NLQuery) -> DSLSelectSpec:
         columns = [self._map_column(col) for col in query.columns] or ["*"]
-        table = self._map_table(query.table)
+        # Table may be omitted in terse requests; attempt to infer from columns when missing
+        if query.table:
+            table = self._map_table(query.table)
+        else:
+            table = None
+            lowered_cols = " ".join(col.lower() for col in query.columns)
+            if "job" in lowered_cols or "title" in lowered_cols or "hire" in lowered_cols:
+                table = "Employees"
+            elif "customer" in lowered_cols or "customer_id" in lowered_cols:
+                table = "Customers"
+            elif "product" in lowered_cols or "price" in lowered_cols:
+                table = "Products"
+            elif "student" in lowered_cols or "gpa" in lowered_cols:
+                table = "Students"
+            elif "book" in lowered_cols or "author" in lowered_cols:
+                table = "Books"
+            else:
+                # fallback to generic Table name when not inferrable
+                table = "Table"
+        # normalize table for DSL (lowercase) since DSL emits lowercased names
+        table = table.lower() if table else table
         conditions = self._map_condition_chain(query.where)
-        return DSLSelectSpec(columns=columns, table=table, conditions=conditions)
+
+        # Heuristics: when user requests the "most expensive products" prefer product name + price
+        mapped_order_clauses: List[tuple[str, bool]] = []
+        for col_name, is_desc in query.order_clauses:
+            mapped_col = self._map_column(col_name)
+            mapped_order_clauses.append((mapped_col, is_desc))
+        
+        if columns == ["*"] and table == "products":
+            for col_name, _ in mapped_order_clauses:
+                if col_name == "price":
+                    columns = [self._map_column("product name"), self._map_column("price")]
+                    break
+
+        # For paging requests, if no explicit ORDER BY, set sensible default ordering
+        if (query.limit or query.offset) and not mapped_order_clauses:
+            if table == "customers":
+                mapped_order_clauses.append((self._map_column("customer id"), False))
+            elif table == "products":
+                mapped_order_clauses.append((self._map_column("product id"), False))
+            elif table == "employees":
+                mapped_order_clauses.append((self._map_column("employee id"), False))
+            elif table == "students":
+                mapped_order_clauses.append((self._map_column("student id"), False))
+            elif table == "books":
+                mapped_order_clauses.append((self._map_column("book id"), False))
+
+        return DSLSelectSpec(
+            columns=columns,
+            table=table,
+            conditions=conditions,
+            distinct=query.distinct,
+            order_clauses=mapped_order_clauses,
+            limit=query.limit,
+            offset=query.offset,
+        )
 
     def _map_insert(self, statement: NLInsert) -> DSLInsertSpec:
         columns: List[str] = []
@@ -730,6 +1123,10 @@ class SemanticMapper:
         return DSLUpdateSpec(table=table, assignments=assignments, conditions=conditions)
 
     def _map_column(self, phrase: str) -> str:
+        if phrase is None:
+            return "column"
+        if phrase.strip() == "*":
+            return "*"
         normalized = _normalize(phrase)
         if normalized in self.mapping["columns"]:
             return self.mapping["columns"][normalized]
@@ -837,10 +1234,27 @@ class CodeGenerator:
     def generate(self, ast: SQLStatement) -> str:
         if isinstance(ast, SQLSelect):
             columns = ", ".join(ast.columns) if ast.columns else "*"
-            sql = f"SELECT {columns} FROM {ast.table}"
+            sql = "SELECT"
+            if getattr(ast, "distinct", False):
+                sql += " DISTINCT"
+            sql += f" {columns} FROM {ast.table}"
             where_clause = self._render_conditions(ast.where)
             if where_clause:
                 sql += f" WHERE {where_clause}"
+            # Render multi-column ORDER BY
+            if getattr(ast, "order_clauses", None):
+                order_parts = []
+                for col, is_desc in ast.order_clauses:
+                    part = col
+                    if is_desc:
+                        part += " DESC"
+                    order_parts.append(part)
+                if order_parts:
+                    sql += " ORDER BY " + ", ".join(order_parts)
+            if getattr(ast, "limit", None) is not None:
+                sql += f" LIMIT {ast.limit}"
+            if getattr(ast, "offset", None) is not None:
+                sql += f" OFFSET {ast.offset}"
             return sql + ";"
         if isinstance(ast, SQLInsert):
             columns_clause = f"({', '.join(ast.columns)})" if ast.columns else ""
@@ -896,11 +1310,30 @@ class DSLBuilder:
         raise TypeError(f"Unsupported DSL spec: {type(spec).__name__}")
 
     def _render_select(self, spec: DSLSelectSpec) -> str:
-        tokens: List[str] = ["SELECT", "TABLE", spec.table, "COLUMNS"]
+        tokens: List[str] = ["SELECT"]
+        if getattr(spec, "distinct", False):
+            tokens.append("DISTINCT")
+        tokens.extend(["TABLE", spec.table.lower(), "COLUMNS"])
         tokens.extend(self._render_identifiers(spec.columns or ["*"]))
         if spec.conditions:
             tokens.append("WHERE")
             tokens.extend(self._render_conditions(spec.conditions))
+        # Render multi-column ORDER BY
+        if getattr(spec, "order_clauses", None):
+            tokens.append("ORDER")
+            tokens.append("BY")
+            for idx, (col, is_desc) in enumerate(spec.order_clauses):
+                if idx > 0:
+                    tokens.append("COMMA")
+                tokens.append(col)
+                if is_desc:
+                    tokens.append("DESC")
+        if getattr(spec, "limit", None) is not None:
+            tokens.append("LIMIT")
+            tokens.append(str(spec.limit))
+            if getattr(spec, "offset", None) is not None:
+                tokens.append("OFFSET")
+                tokens.append(str(spec.offset))
         return " ".join(tokens)
 
     def _render_insert(self, spec: DSLInsertSpec) -> str:
@@ -973,6 +1406,11 @@ class DSLTokenizer:
         "TABLE",
         "COLUMNS",
         "WHERE",
+        "DISTINCT",
+        "ORDER",
+        "BY",
+        "LIMIT",
+        "OFFSET",
         "INSERT",
         "DELETE",
         "UPDATE",
@@ -980,6 +1418,8 @@ class DSLTokenizer:
         "VALUES",
         "AND",
         "OR",
+        "DESC",
+        "ASC",
     }
     SIMPLE_TOKENS = {
         ",": "COMMA",
@@ -1334,12 +1774,93 @@ class DSLParser:
         )
         add(
             "SelectStmt",
-            ("SELECT", "TABLE", "IDENT", "COLUMNS", "SelectColumns", "WhereOpt"),
+            ("SELECT", "DistinctOpt", "TABLE", "IDENT", "COLUMNS", "SelectColumns", "WhereOpt", "OrderOpt", "LimitOpt"),
             lambda values: SQLSelect(
-                columns=values[4],
-                table=values[2].value,
-                where=conditions_to_chain(values[5]),
+                columns=values[5],
+                table=values[3].value,
+                where=conditions_to_chain(values[6]),
+                distinct=values[1],
+                order_clauses=values[7],
+                limit=values[8][0],
+                offset=values[8][1],
             ),
+        )
+
+        add(
+            "DistinctOpt",
+            ("DISTINCT",),
+            lambda values: True,
+        )
+        add(
+            "DistinctOpt",
+            tuple(),
+            lambda values: False,
+        )
+
+        add(
+            "OrderOpt",
+            ("ORDER", "BY", "OrderList"),
+            lambda values: values[2],
+        )
+        add(
+            "OrderOpt",
+            tuple(),
+            lambda values: [],
+        )
+
+        add(
+            "OrderList",
+            ("OrderList", "COMMA", "OrderItem"),
+            lambda values: values[0] + [values[2]],
+        )
+        add(
+            "OrderList",
+            ("OrderItem",),
+            lambda values: [values[0]],
+        )
+
+        add(
+            "OrderItem",
+            ("IDENT", "OrderDir"),
+            lambda values: (values[0].value, values[1]),
+        )
+
+        add(
+            "OrderDir",
+            ("DESC",),
+            lambda values: True,
+        )
+        add(
+            "OrderDir",
+            ("ASC",),
+            lambda values: False,
+        )
+        add(
+            "OrderDir",
+            tuple(),
+            lambda values: False,
+        )
+
+        add(
+            "LimitOpt",
+            ("LIMIT", "NUMBER", "OffsetOpt"),
+            lambda values: (int(values[1].value), values[2]),
+        )
+        add(
+            "LimitOpt",
+            tuple(),
+            lambda values: (None, None),
+        )
+
+        add(
+            "OffsetOpt",
+            ("OFFSET", "NUMBER"),
+            lambda values: int(values[1].value),
+        )
+        add(
+            "OffsetOpt",
+            tuple(),
+            lambda values: None,
         )
         add(
             "WhereOpt",
@@ -1579,6 +2100,7 @@ def main() -> None:
     print("  - INSERT: Add new records to tables")
     print("  - DELETE: Remove records from tables")
     print("  - UPDATE: Modify existing records in tables\n")
+    print("  - ORDER BY: Order existing records in tables\n")
     print("How to use:")
     print("  1. Type an English request such as:")
     print("       Get the names and emails of customers who live in Jakarta.")
@@ -1632,4 +2154,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
