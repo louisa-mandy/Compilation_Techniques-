@@ -26,6 +26,33 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, ttk
+
+
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
+        self.canvas = tk.Canvas(self)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
 
 # --------------------------------------------------------------------------- #
 # Lexer
@@ -692,6 +719,14 @@ class LL1Parser:
             if token.type == TokenType.KEYWORD and token.value in self.CONNECTORS and tokens:
                 break
             if token.type == TokenType.KEYWORD and token.value == "AND" and tokens:
+                break
+            if token.type == TokenType.KEYWORD and token.value == "WHERE" and tokens:
+                break
+            if token.type == TokenType.KEYWORD and token.value == "ORDER" and tokens:
+                break
+            if token.type == TokenType.KEYWORD and token.value == "LIMIT" and tokens:
+                break
+            if token.type == TokenType.KEYWORD and token.value == "OFFSET" and tokens:
                 break
             tokens.append(self._advance())
         if not tokens:
@@ -2088,69 +2123,140 @@ class NLToSQLCompiler:
 
 
 # --------------------------------------------------------------------------- #
-# Demonstration
+# GUI
 # --------------------------------------------------------------------------- #
 
 
+class NLToSQLGUI:
+    def __init__(self, root):
+        self.compiler = NLToSQLCompiler()
+        self.root = root
+        self.root.title("NL to SQL Compiler")
+        self.root.geometry("600x500")
+        self.root.resizable(True, True)
+
+        # Style
+        style = ttk.Style()
+        style.configure("TLabel", font=("Arial", 10))
+        style.configure("TButton", font=("Arial", 9))
+
+        # Scrollable frame
+        self.scrollable_frame = ScrollableFrame(root)
+        self.scrollable_frame.pack(fill="both", expand=True)
+        main_frame = self.scrollable_frame.scrollable_frame
+
+        # Title
+        title_label = ttk.Label(main_frame, text="Natural Language → SQL Compiler", font=("Arial", 14, "bold"))
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 10))
+
+        # Instructions
+        instr_frame = ttk.LabelFrame(main_frame, text="Available SQL Syntax", padding=5)
+        instr_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        ttk.Label(instr_frame, text="• SELECT: Get data from tables").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(instr_frame, text="• INSERT: Add new records").grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(instr_frame, text="• DELETE: Remove records").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(instr_frame, text="• UPDATE: Modify records").grid(row=3, column=0, sticky=tk.W)
+        ttk.Label(instr_frame, text="• ORDER BY: Sort records").grid(row=4, column=0, sticky=tk.W)
+
+        # Input
+        ttk.Label(main_frame, text="Enter query:").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
+        self.input_text = scrolledtext.ScrolledText(main_frame, height=3, wrap=tk.WORD, font=("Arial", 9))
+        self.input_text.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=4, column=0, columnspan=2, pady=(0, 10))
+        ttk.Button(button_frame, text="Compile", command=self.compile_query).grid(row=0, column=0, padx=5)
+        ttk.Button(button_frame, text="Examples", command=self.show_examples).grid(row=0, column=1, padx=5)
+        ttk.Button(button_frame, text="Clear", command=self.clear_output).grid(row=0, column=2, padx=5)
+
+        # Output frame
+        output_frame = ttk.LabelFrame(main_frame, text="Output", padding=5)
+        output_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # DSL
+        ttk.Label(output_frame, text="DSL:").grid(row=0, column=0, sticky=tk.W)
+        self.dsl_text = scrolledtext.ScrolledText(output_frame, height=2, wrap=tk.WORD, state='disabled', font=("Courier", 9))
+        self.dsl_text.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+
+        # SQL
+        ttk.Label(output_frame, text="SQL:").grid(row=2, column=0, sticky=tk.W)
+        self.sql_text = scrolledtext.ScrolledText(output_frame, height=2, wrap=tk.WORD, state='disabled', font=("Courier", 9))
+        self.sql_text.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+
+        # Recommendations
+        ttk.Label(output_frame, text="Recommendations:").grid(row=4, column=0, sticky=tk.W)
+        self.rec_text = scrolledtext.ScrolledText(output_frame, height=2, wrap=tk.WORD, state='disabled', font=("Arial", 9))
+        self.rec_text.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E))
+
+        # Configure grid weights
+        main_frame.columnconfigure(1, weight=1)
+        output_frame.columnconfigure(1, weight=1)
+
+    def compile_query(self):
+        query = self.input_text.get("1.0", tk.END).strip()
+        if not query:
+            messagebox.showwarning("Warning", "Please enter a query.")
+            return
+        try:
+            artifacts = self.compiler.compile_with_artifacts(query)
+            self.update_output(artifacts)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def update_output(self, artifacts):
+        self.dsl_text.config(state='normal')
+        self.dsl_text.delete("1.0", tk.END)
+        self.dsl_text.insert(tk.END, artifacts.dsl)
+        self.dsl_text.config(state='disabled')
+
+        self.sql_text.config(state='normal')
+        self.sql_text.delete("1.0", tk.END)
+        self.sql_text.insert(tk.END, artifacts.sql)
+        self.sql_text.config(state='disabled')
+
+        self.rec_text.config(state='normal')
+        self.rec_text.delete("1.0", tk.END)
+        if artifacts.recommendations:
+            self.rec_text.insert(tk.END, "\n".join(artifacts.recommendations))
+        else:
+            self.rec_text.insert(tk.END, "None")
+        self.rec_text.config(state='disabled')
+
+    def show_examples(self):
+        examples = [
+            "Get the names and emails of customers who live in Jakarta.",
+            "Insert a new record into customers with name Sarah and status Active.",
+            "Delete the records from customers who live in Jakarta.",
+            "Update the customers with status Active where city is Jakarta."
+        ]
+        example_window = tk.Toplevel(self.root)
+        example_window.title("Examples")
+        example_window.geometry("550x350")
+        example_window.resizable(False, False)
+        text = scrolledtext.ScrolledText(example_window, wrap=tk.WORD, font=("Arial", 9))
+        text.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        for ex in examples:
+            text.insert(tk.END, ex + "\n\n")
+        text.config(state='disabled')
+
+    def clear_output(self):
+        self.input_text.delete("1.0", tk.END)
+        self.dsl_text.config(state='normal')
+        self.dsl_text.delete("1.0", tk.END)
+        self.dsl_text.config(state='disabled')
+        self.sql_text.config(state='normal')
+        self.sql_text.delete("1.0", tk.END)
+        self.sql_text.config(state='disabled')
+        self.rec_text.config(state='normal')
+        self.rec_text.delete("1.0", tk.END)
+        self.rec_text.config(state='disabled')
+
+
 def main() -> None:
-    compiler = NLToSQLCompiler()
-    print("Natural Language → SQL compiler\n")
-    print("Available SQL Syntax:")
-    print("  - SELECT: Get data from tables")
-    print("  - INSERT: Add new records to tables")
-    print("  - DELETE: Remove records from tables")
-    print("  - UPDATE: Modify existing records in tables\n")
-    print("  - ORDER BY: Order existing records in tables\n")
-    print("How to use:")
-    print("  1. Type an English request such as:")
-    print("       Get the names and emails of customers who live in Jakarta.")
-    print("       Insert a new record into customers with name Sarah and status Active.")
-    print("       Delete the records from customers who live in Jakarta.")
-    print("       Update the customers with status Active where city is Jakarta.")
-    print("  2. Press Enter to compile it into SQL.\n")
-    select_example = "Get the names and emails of customers who live in Jakarta."
-    insert_example = "Insert a new record into customers with name Sarah and status Active."
-    delete_example = "Delete the records from customers who live in Jakarta."
-    update_example = "Update the customers with status Active where city is Jakarta."
-    print("Examples:")
-    select_artifacts = compiler.compile_with_artifacts(select_example)
-    insert_artifacts = compiler.compile_with_artifacts(insert_example)
-    delete_artifacts = compiler.compile_with_artifacts(delete_example)
-    update_artifacts = compiler.compile_with_artifacts(update_example)
-    print(f"  NL : {select_example}")
-    print(f"  DSL: {select_artifacts.dsl}")
-    print(f"  SQL: {select_artifacts.sql}\n")
-    print(f"  NL : {insert_example}")
-    print(f"  DSL: {insert_artifacts.dsl}")
-    print(f"  SQL: {insert_artifacts.sql}\n")
-    print(f"  NL : {delete_example}")
-    print(f"  DSL: {delete_artifacts.dsl}")
-    print(f"  SQL: {delete_artifacts.sql}\n")
-    print(f"  NL : {update_example}")
-    print(f"  DSL: {update_artifacts.dsl}")
-    print(f"  SQL: {update_artifacts.sql}\n")
-    print("Enter natural-language requests (blank line exits):\n")
-
-    try:
-        while True:
-            line = input("NL> ").strip()
-            if not line:
-                break
-            try:
-                artifacts = compiler.compile_with_artifacts(line)
-                if artifacts.recommendations:
-                    print("Recommendations:")
-                    for recommendation in artifacts.recommendations:
-                        print(f"  - {recommendation}")
-                print("DSL:", artifacts.dsl)
-                print("SQL:", artifacts.sql)
-            except Exception as exc:
-                print("Error:", exc)
-    except EOFError:
-        pass
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-
+    root = tk.Tk()
+    app = NLToSQLGUI(root)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
