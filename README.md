@@ -1,4 +1,4 @@
-# CompTech: Natural Language to SQL Compiler 🗣️➡️🗄️
+# Natural Language to SQL Compiler 🗣️➡️🗄️
 
 Welcome to **CompTech**, a fascinating mini-compiler that transforms everyday English sentences into executable SQL queries! Ever dreamed of chatting with your database? This project makes it possible by bridging natural language and SQL through a multi-stage compilation pipeline.
 
