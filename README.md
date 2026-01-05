@@ -1,4 +1,4 @@
-# Computational Techniques Final Project: Natural Language to SQL Compiler Manual 🗣️➡️🗄️
+# NLP to SQL: Translation Engine Using RuleBased and Parsing Techniques 🗣️➡️🗄️
 
 ## 🌟 Introduction
 
