@@ -26,32 +26,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
-
-
-class ScrollableFrame(ttk.Frame):
-    def __init__(self, container, *args, **kwargs):
-        super().__init__(container, *args, **kwargs)
-        self.canvas = tk.Canvas(self)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
-
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+import streamlit as st
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +316,20 @@ SQLStatement = SQLSelect | SQLInsert | SQLDelete | SQLUpdate
 class CompilerArtifacts:
     sql: str
     dsl: str
+    recommendations: List[str]
+
+
+@dataclass
+class CompilerDebugInfo:
+    """Debug information showing all compiler phases."""
+    original_text: str
+    enhanced_text: str
+    tokens: List[Token]
+    nl_ast: NLStatement
+    dsl_spec: DSLStatementSpec
+    dsl_script: str
+    sql_ast: SQLStatement
+    sql: str
     recommendations: List[str]
 
 
@@ -2102,6 +2091,28 @@ class NLToSQLCompiler:
     def compile_with_artifacts(self, text: str) -> CompilerArtifacts:
         sql, dsl, recommendations = self._run_pipeline(text)
         return CompilerArtifacts(sql=sql, dsl=dsl, recommendations=recommendations)
+    
+    def compile_with_debug(self, text: str) -> CompilerDebugInfo:
+        """Compile with full debug information for all phases."""
+        enhanced_text, recommendations = self.recommender.enhance(text)
+        tokens = NLLexer(enhanced_text).tokenize()
+        nl_ast = LL1Parser(tokens).parse()
+        dsl_spec = self.mapper.map(nl_ast)
+        dsl_script = self.dsl_builder.build(dsl_spec)
+        sql_ast = self.dsl_parser.parse(dsl_script)
+        sql = self.generator.generate(sql_ast)
+        
+        return CompilerDebugInfo(
+            original_text=text,
+            enhanced_text=enhanced_text,
+            tokens=tokens,
+            nl_ast=nl_ast,
+            dsl_spec=dsl_spec,
+            dsl_script=dsl_script,
+            sql_ast=sql_ast,
+            sql=sql,
+            recommendations=recommendations
+        )
 
     def _run_pipeline(self, text: str) -> Tuple[str, str, List[str]]:
         enhanced_text, recommendations = self.recommender.enhance(text)
@@ -2123,140 +2134,417 @@ class NLToSQLCompiler:
 
 
 # --------------------------------------------------------------------------- #
-# GUI
+# Streamlit GUI
 # --------------------------------------------------------------------------- #
 
 
-class NLToSQLGUI:
-    def __init__(self, root):
-        self.compiler = NLToSQLCompiler()
-        self.root = root
-        self.root.title("NL to SQL Compiler")
-        self.root.geometry("600x500")
-        self.root.resizable(True, True)
-
-        # Style
-        style = ttk.Style()
-        style.configure("TLabel", font=("Arial", 10))
-        style.configure("TButton", font=("Arial", 9))
-
-        # Scrollable frame
-        self.scrollable_frame = ScrollableFrame(root)
-        self.scrollable_frame.pack(fill="both", expand=True)
-        main_frame = self.scrollable_frame.scrollable_frame
-
-        # Title
-        title_label = ttk.Label(main_frame, text="Natural Language → SQL Compiler", font=("Arial", 14, "bold"))
-        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 10))
-
-        # Instructions
-        instr_frame = ttk.LabelFrame(main_frame, text="Available SQL Syntax", padding=5)
-        instr_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        ttk.Label(instr_frame, text="• SELECT: Get data from tables").grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(instr_frame, text="• INSERT: Add new records").grid(row=1, column=0, sticky=tk.W)
-        ttk.Label(instr_frame, text="• DELETE: Remove records").grid(row=2, column=0, sticky=tk.W)
-        ttk.Label(instr_frame, text="• UPDATE: Modify records").grid(row=3, column=0, sticky=tk.W)
-        ttk.Label(instr_frame, text="• ORDER BY: Sort records").grid(row=4, column=0, sticky=tk.W)
-
-        # Input
-        ttk.Label(main_frame, text="Enter query:").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
-        self.input_text = scrolledtext.ScrolledText(main_frame, height=3, wrap=tk.WORD, font=("Arial", 9))
-        self.input_text.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=2, pady=(0, 10))
-        ttk.Button(button_frame, text="Compile", command=self.compile_query).grid(row=0, column=0, padx=5)
-        ttk.Button(button_frame, text="Examples", command=self.show_examples).grid(row=0, column=1, padx=5)
-        ttk.Button(button_frame, text="Clear", command=self.clear_output).grid(row=0, column=2, padx=5)
-
-        # Output frame
-        output_frame = ttk.LabelFrame(main_frame, text="Output", padding=5)
-        output_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # DSL
-        ttk.Label(output_frame, text="DSL:").grid(row=0, column=0, sticky=tk.W)
-        self.dsl_text = scrolledtext.ScrolledText(output_frame, height=2, wrap=tk.WORD, state='disabled', font=("Courier", 9))
-        self.dsl_text.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
-
-        # SQL
-        ttk.Label(output_frame, text="SQL:").grid(row=2, column=0, sticky=tk.W)
-        self.sql_text = scrolledtext.ScrolledText(output_frame, height=2, wrap=tk.WORD, state='disabled', font=("Courier", 9))
-        self.sql_text.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
-
-        # Recommendations
-        ttk.Label(output_frame, text="Recommendations:").grid(row=4, column=0, sticky=tk.W)
-        self.rec_text = scrolledtext.ScrolledText(output_frame, height=2, wrap=tk.WORD, state='disabled', font=("Arial", 9))
-        self.rec_text.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E))
-
-        # Configure grid weights
-        main_frame.columnconfigure(1, weight=1)
-        output_frame.columnconfigure(1, weight=1)
-
-    def compile_query(self):
-        query = self.input_text.get("1.0", tk.END).strip()
-        if not query:
-            messagebox.showwarning("Warning", "Please enter a query.")
-            return
-        try:
-            artifacts = self.compiler.compile_with_artifacts(query)
-            self.update_output(artifacts)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def update_output(self, artifacts):
-        self.dsl_text.config(state='normal')
-        self.dsl_text.delete("1.0", tk.END)
-        self.dsl_text.insert(tk.END, artifacts.dsl)
-        self.dsl_text.config(state='disabled')
-
-        self.sql_text.config(state='normal')
-        self.sql_text.delete("1.0", tk.END)
-        self.sql_text.insert(tk.END, artifacts.sql)
-        self.sql_text.config(state='disabled')
-
-        self.rec_text.config(state='normal')
-        self.rec_text.delete("1.0", tk.END)
-        if artifacts.recommendations:
-            self.rec_text.insert(tk.END, "\n".join(artifacts.recommendations))
+def format_tokens(tokens: List[Token]) -> str:
+    """Format tokens for display."""
+    lines = []
+    for token in tokens:
+        if token.type == TokenType.EOF:
+            lines.append(f"EOF")
         else:
-            self.rec_text.insert(tk.END, "None")
-        self.rec_text.config(state='disabled')
+            lines.append(f"{token.type.name:15} : {token.value!r}")
+    return "\n".join(lines)
 
-    def show_examples(self):
+
+def format_nl_ast(ast: NLStatement) -> str:
+    """Format NL AST for display."""
+    import json
+    from dataclasses import asdict
+    
+    def ast_to_dict(obj):
+        """Convert AST to dictionary, handling nested structures."""
+        if isinstance(obj, (NLQuery, NLInsert, NLDelete, NLUpdate)):
+            result = {
+                "type": obj.__class__.__name__,
+            }
+            for key, value in asdict(obj).items():
+                if value is None:
+                    continue
+                if isinstance(value, NLCondition):
+                    result[key] = format_condition(value)
+                elif isinstance(value, list) and value and isinstance(value[0], tuple):
+                    result[key] = [list(t) for t in value]
+                else:
+                    result[key] = value
+            return result
+        return str(obj)
+    
+    def format_condition(cond: NLCondition) -> dict:
+        """Format condition chain recursively."""
+        result = {
+            "words": cond.words,
+            "connector": cond.connector
+        }
+        if cond.next_condition:
+            result["next"] = format_condition(cond.next_condition)
+        return result
+    
+    ast_dict = ast_to_dict(ast)
+    return json.dumps(ast_dict, indent=2)
+
+
+def format_sql_ast(ast: SQLStatement) -> str:
+    """Format SQL AST for display."""
+    import json
+    from dataclasses import asdict
+    
+    def ast_to_dict(obj):
+        """Convert SQL AST to dictionary."""
+        if isinstance(obj, (SQLSelect, SQLInsert, SQLDelete, SQLUpdate)):
+            result = {
+                "type": obj.__class__.__name__,
+            }
+            for key, value in asdict(obj).items():
+                if value is None:
+                    continue
+                if isinstance(value, SQLCondition):
+                    result[key] = format_sql_condition(value)
+                elif isinstance(value, list) and value and isinstance(value[0], tuple):
+                    result[key] = [list(t) for t in value]
+                else:
+                    result[key] = value
+            return result
+        return str(obj)
+    
+    def format_sql_condition(cond: SQLCondition) -> dict:
+        """Format SQL condition chain recursively."""
+        result = {
+            "left": cond.left,
+            "operator": cond.operator,
+            "right": cond.right,
+            "connector": cond.connector
+        }
+        if cond.next_condition:
+            result["next"] = format_sql_condition(cond.next_condition)
+        return result
+    
+    ast_dict = ast_to_dict(ast)
+    return json.dumps(ast_dict, indent=2)
+
+
+def format_dsl_spec(spec: DSLStatementSpec) -> str:
+    """Format DSL spec for display."""
+    import json
+    from dataclasses import asdict
+    
+    def spec_to_dict(obj):
+        """Convert DSL spec to dictionary."""
+        if isinstance(obj, (DSLSelectSpec, DSLInsertSpec, DSLDeleteSpec, DSLUpdateSpec)):
+            result = {
+                "type": obj.__class__.__name__,
+            }
+            for key, value in asdict(obj).items():
+                if value is None or (isinstance(value, list) and not value):
+                    continue
+                if isinstance(value, list) and value and isinstance(value[0], DSLConditionSpec):
+                    result[key] = [asdict(c) for c in value]
+                elif isinstance(value, list) and value and isinstance(value[0], tuple):
+                    result[key] = [list(t) for t in value]
+                else:
+                    result[key] = value
+            return result
+        return str(obj)
+    
+    spec_dict = spec_to_dict(spec)
+    return json.dumps(spec_dict, indent=2)
+
+
+def get_grammar_info() -> str:
+    """Get grammar information."""
+    info = []
+    info.append("LL(1) Parser Grammar (Natural Language):")
+    info.append("=" * 50)
+    info.append("\nKeywords:")
+    info.append(", ".join(sorted(NLLexer.KEYWORDS)))
+    info.append("\n\nDSL Grammar (LALR):")
+    info.append("=" * 50)
+    info.append("\nDSL Keywords:")
+    info.append(", ".join(sorted(DSLTokenizer.KEYWORDS)))
+    info.append("\n\nProduction Rules:")
+    info.append("Statement → SelectStmt | InsertStmt | DeleteStmt | UpdateStmt")
+    info.append("SelectStmt → SELECT [DISTINCT] TABLE IDENT COLUMNS SelectColumns [WhereOpt] [OrderOpt] [LimitOpt]")
+    info.append("InsertStmt → INSERT TABLE IDENT COLUMNS ColumnSeq VALUES LiteralSeq")
+    info.append("DeleteStmt → DELETE TABLE IDENT [WhereOpt]")
+    info.append("UpdateStmt → UPDATE TABLE IDENT SET AssignmentSeq [WhereOpt]")
+    return "\n".join(info)
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="NL to SQL Compiler",
+        page_icon="🔍",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Initialize compiler
+    if 'compiler' not in st.session_state:
+        st.session_state.compiler = NLToSQLCompiler()
+    
+    compiler = st.session_state.compiler
+    
+    # Title
+    st.title("🔍 Natural Language → SQL Compiler")
+    st.markdown("---")
+    
+    # Sidebar with instructions and examples
+    with st.sidebar:
+        st.header("📖 Available SQL Syntax")
+        st.markdown("""
+        - **SELECT**: Get data from tables
+        - **INSERT**: Add new records
+        - **DELETE**: Remove records
+        - **UPDATE**: Modify records
+        - **ORDER BY**: Sort records
+        """)
+        
+        st.header("💡 Example Queries")
         examples = [
             "Get the names and emails of customers who live in Jakarta.",
             "Insert a new record into customers with name Sarah and status Active.",
             "Delete the records from customers who live in Jakarta.",
-            "Update the customers with status Active where city is Jakarta."
+            "Update the customers with status Active where city is Jakarta.",
+            "Show the top 5 most expensive products ordered by price descending."
         ]
-        example_window = tk.Toplevel(self.root)
-        example_window.title("Examples")
-        example_window.geometry("550x350")
-        example_window.resizable(False, False)
-        text = scrolledtext.ScrolledText(example_window, wrap=tk.WORD, font=("Arial", 9))
-        text.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
-        for ex in examples:
-            text.insert(tk.END, ex + "\n\n")
-        text.config(state='disabled')
+        
+        # Initialize query_text in session state if not present
+        if 'query_text' not in st.session_state:
+            st.session_state.query_text = ''
+        
+        for i, example in enumerate(examples):
+            if st.button(f"Example {i+1}", key=f"example_{i}"):
+                st.session_state.query_text = example
+                st.rerun()
+    
+    # Initialize query_text if not present
+    if 'query_text' not in st.session_state:
+        st.session_state.query_text = ''
+    
+    # Main input area
+    st.header("Enter Your Query")
+    
+    # Buttons
+    col1, col2, col3 = st.columns([1, 1, 6])
+    with col1:
+        compile_button = st.button("🚀 Compile", type="primary", use_container_width=True)
+    with col2:
+        clear_button = st.button("🗑️ Clear", use_container_width=True)
+    
+    # Handle clear button click - must be before widget creation
+    if clear_button:
+        st.session_state.query_text = ""
+        if 'artifacts' in st.session_state:
+            del st.session_state.artifacts
+        if 'debug_info' in st.session_state:
+            del st.session_state.debug_info
+        st.rerun()
+    
+    # Create text_area WITHOUT key to allow manual state management
+    query = st.text_area(
+        "Natural Language Query:",
+        value=st.session_state.query_text,
+        height=100,
+        placeholder="e.g., Get the names and emails of customers who live in Jakarta."
+    )
+    
+    # Update session state with widget value
+    st.session_state.query_text = query
+    
+    # Process query
+    if compile_button:
+        if not query.strip():
+            st.warning("⚠️ Please enter a query.")
+            if 'artifacts' in st.session_state:
+                del st.session_state.artifacts
+            if 'debug_info' in st.session_state:
+                del st.session_state.debug_info
+        else:
+            try:
+                # Get both regular artifacts and debug info
+                artifacts = compiler.compile_with_artifacts(query)
+                debug_info = compiler.compile_with_debug(query)
+                st.session_state.artifacts = artifacts
+                st.session_state.debug_info = debug_info
+                st.session_state.last_query = query
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                st.exception(e)
+                if 'artifacts' in st.session_state:
+                    del st.session_state.artifacts
+                if 'debug_info' in st.session_state:
+                    del st.session_state.debug_info
+    
+    # Display results if available
+    if 'artifacts' in st.session_state and st.session_state.artifacts:
+        artifacts = st.session_state.artifacts
+        
+        # Output sections
+        st.markdown("---")
+        
+        # DSL output (collapsible)
+        with st.expander("🔷 DSL (Intermediate Representation)", expanded=False):
+            st.code(artifacts.dsl, language="text")
+        
+        # SQL output (expanded by default)
+        st.header("💾 Generated SQL")
+        st.code(artifacts.sql, language="sql")
+        
+        # Recommendations (collapsible)
+        if artifacts.recommendations:
+            with st.expander("💡 Recommendations", expanded=False):
+                for rec in artifacts.recommendations:
+                    st.info(rec)
+        else:
+            with st.expander("💡 Recommendations", expanded=False):
+                st.success("No recommendations. Query processed successfully!")
+        
+        # Debug/Compiler Phases Section
+        st.markdown("---")
+        with st.expander("🔬 Compiler Phases & Debug Information", expanded=False):
+            if 'debug_info' in st.session_state and st.session_state.debug_info:
+                debug_info = st.session_state.debug_info
+                
+                # Create tabs for different phases
+                tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                    "📝 Input/Output", "🔤 Tokens", "🌳 NL AST", 
+                    "🔷 DSL Spec", "🌲 SQL AST", "📚 Grammar", "📊 Parser Info"
+                ])
+                
+                with tab1:
+                    st.subheader("Original Input")
+                    st.code(debug_info.original_text, language="text")
+                    
+                    if debug_info.enhanced_text != debug_info.original_text:
+                        st.subheader("Enhanced Text (after recommendations)")
+                        st.code(debug_info.enhanced_text, language="text")
+                    
+                    st.subheader("Final SQL Output")
+                    st.code(debug_info.sql, language="sql")
+                    
+                    st.subheader("Console Output")
+                    console_output = f"""Compiler Execution Log:
+{'='*60}
+Phase 1: Lexical Analysis
+  - Input: {debug_info.original_text!r}
+  - Enhanced: {debug_info.enhanced_text!r}
+  - Tokens generated: {len(debug_info.tokens)}
 
-    def clear_output(self):
-        self.input_text.delete("1.0", tk.END)
-        self.dsl_text.config(state='normal')
-        self.dsl_text.delete("1.0", tk.END)
-        self.dsl_text.config(state='disabled')
-        self.sql_text.config(state='normal')
-        self.sql_text.delete("1.0", tk.END)
-        self.sql_text.config(state='disabled')
-        self.rec_text.config(state='normal')
-        self.rec_text.delete("1.0", tk.END)
-        self.rec_text.config(state='disabled')
+Phase 2: Parsing (LL(1))
+  - AST Type: {debug_info.nl_ast.__class__.__name__}
 
+Phase 3: Semantic Mapping
+  - DSL Spec Type: {debug_info.dsl_spec.__class__.__name__}
 
-def main() -> None:
-    root = tk.Tk()
-    app = NLToSQLGUI(root)
-    root.mainloop()
+Phase 4: DSL Generation
+  - DSL Script: {debug_info.dsl_script}
+
+Phase 5: DSL Parsing (LALR)
+  - SQL AST Type: {debug_info.sql_ast.__class__.__name__}
+
+Phase 6: Code Generation
+  - SQL Generated: {debug_info.sql}
+
+Recommendations: {len(debug_info.recommendations)} suggestion(s)
+"""
+                    st.code(console_output, language="text")
+                
+                with tab2:
+                    st.subheader("Tokens (Lexical Analysis)")
+                    st.markdown("**Token Stream:**")
+                    tokens_formatted = format_tokens(debug_info.tokens)
+                    st.code(tokens_formatted, language="text")
+                    
+                    st.markdown("**Token Statistics:**")
+                    token_counts = {}
+                    for token in debug_info.tokens:
+                        if token.type != TokenType.EOF:
+                            token_counts[token.type.name] = token_counts.get(token.type.name, 0) + 1
+                    
+                    for token_type, count in sorted(token_counts.items()):
+                        st.text(f"  {token_type}: {count}")
+                
+                with tab3:
+                    st.subheader("Natural Language AST (LL(1) Parser Output)")
+                    st.markdown("**Abstract Syntax Tree:**")
+                    nl_ast_formatted = format_nl_ast(debug_info.nl_ast)
+                    st.code(nl_ast_formatted, language="json")
+                    
+                    st.markdown("**AST Type:**")
+                    st.info(f"{debug_info.nl_ast.__class__.__name__}")
+                
+                with tab4:
+                    st.subheader("DSL Specification (Semantic Mapping Output)")
+                    st.markdown("**DSL Spec:**")
+                    dsl_spec_formatted = format_dsl_spec(debug_info.dsl_spec)
+                    st.code(dsl_spec_formatted, language="json")
+                    
+                    st.markdown("**DSL Script:**")
+                    st.code(debug_info.dsl_script, language="text")
+                
+                with tab5:
+                    st.subheader("SQL AST (LALR Parser Output)")
+                    st.markdown("**SQL Abstract Syntax Tree:**")
+                    sql_ast_formatted = format_sql_ast(debug_info.sql_ast)
+                    st.code(sql_ast_formatted, language="json")
+                    
+                    st.markdown("**AST Type:**")
+                    st.info(f"{debug_info.sql_ast.__class__.__name__}")
+                
+                with tab6:
+                    st.subheader("Grammar Information")
+                    grammar_info = get_grammar_info()
+                    st.code(grammar_info, language="text")
+                    
+                    st.markdown("**Parser Types:**")
+                    st.markdown("""
+                    - **LL(1) Parser**: Used for parsing Natural Language queries
+                      - Left-to-right, Leftmost derivation
+                      - 1 token lookahead
+                      - Recursive descent parsing
+                    
+                    - **LALR(1) Parser**: Used for parsing DSL (Domain-Specific Language)
+                      - Look-Ahead LR parser
+                      - More powerful than SLR
+                      - Handles left recursion and ambiguity
+                    """)
+                
+                with tab7:
+                    st.subheader("Parser Information")
+                    
+                    st.markdown("**LL(1) Parser Details:**")
+                    st.markdown(f"""
+                    - **Type**: LL(1) - Left-to-right, Leftmost derivation with 1 token lookahead
+                    - **Input**: Natural Language tokens
+                    - **Output**: NL AST (Natural Language Abstract Syntax Tree)
+                    - **Grammar**: Context-free grammar for NL queries
+                    - **Method**: Recursive descent parsing
+                    """)
+                    
+                    st.markdown("**LALR(1) Parser Details:**")
+                    st.markdown(f"""
+                    - **Type**: LALR(1) - Look-Ahead LR parser
+                    - **Input**: DSL tokens
+                    - **Output**: SQL AST (SQL Abstract Syntax Tree)
+                    - **Grammar**: LALR grammar for DSL
+                    - **Method**: Table-driven parsing with action/goto tables
+                    """)
+                    
+                    st.markdown("**Parser Phases:**")
+                    st.markdown("""
+                    1. **Lexical Analysis**: Converts input text to tokens
+                    2. **Syntax Analysis (LL(1))**: Builds NL AST from tokens
+                    3. **Semantic Analysis**: Maps NL AST to DSL specification
+                    4. **DSL Generation**: Converts DSL spec to DSL script
+                    5. **DSL Parsing (LALR)**: Parses DSL script to SQL AST
+                    6. **Code Generation**: Converts SQL AST to SQL string
+                    """)
+            else:
+                st.info("Debug information not available. Please compile a query first.")
+
 
 if __name__ == "__main__":
     main()
+
