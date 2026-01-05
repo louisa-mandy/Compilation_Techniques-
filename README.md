@@ -1,70 +1,241 @@
-# Natural Language to SQL Compiler 🗣️➡️🗄️
+# Computational Techniques Final Project: Natural Language to SQL Compiler Manual 🗣️➡️🗄️
 
-Welcome to **CompTech**, a fascinating mini-compiler that transforms everyday English sentences into executable SQL queries! Ever dreamed of chatting with your database? This project makes it possible by bridging natural language and SQL through a multi-stage compilation pipeline.
+## 🌟 Introduction
 
-## 🌟 What Makes It Cool?
-
-CompTech isn't just another query builder—it's a **full-fledged compiler** inspired by real programming language design. It tokenizes, parses, maps semantics, builds an intermediate DSL, validates it, and generates SQL. Plus, it comes with a sleek GUI for easy interaction!
+This program is   an educational tool demonstrating compiler principles applied to natural language processing for database queries. It translates restricted English queries into SQL statements for basic CRUD operations (Create, Read, Update, Delete). The program features a graphical user interface (GUI) for easy interaction and is designed to be extensible.
 
 ### Key Features
 - **Natural Language Support**: Handles queries like "Get the names of customers in Jakarta" or "Update employees with status Active."
-- **Multi-Operation SQL**: Supports SELECT, INSERT, DELETE, UPDATE with WHERE, ORDER BY, DISTINCT, and LIMIT.
-- **Intelligent Mapping**: Uses patterns and tables (e.g., Customers, Employees) to interpret business terms.
-- **Error Handling & Recommendations**: Suggests fixes for unrecognized words.
-- **User-Friendly GUI**: Scrollable interface with input, output, and examples— no command-line hassle!
-- **Extensible Design**: Built with modularity in mind; easy to add new tables, columns, or patterns.
+- **Multi-Operation SQL**: Supports SELECT, INSERT, DELETE, UPDATE with WHERE, ORDER BY, DISTINCT, LIMIT, and OFFSET.
+- **Intelligent Mapping**: Uses predefined patterns and tables (e.g., Customers, Employees) to interpret business terms.
+- **Error Handling & Recommendations**: Suggests fixes for unrecognized words using string similarity.
+- **User-Friendly GUI**: Modern Streamlit web-based interface with input, output, and examples—no command-line required!
+- **Compiler Phases Debug View**: Comprehensive debug section showing tokens, ASTs, grammar, and parser information for educational purposes.
+- **Extensible Design**: Modular architecture allows adding new tables, columns, or patterns easily.
 
-## 🏗️ Architecture Overview
-
-CompTech follows a classic compiler pipeline:
-
-1. **Lexer (NLLexer)**: Breaks English text into tokens (keywords, identifiers, etc.).
-2. **Parser (LL1Parser)**: Builds an Abstract Syntax Tree (AST) for NL statements.
-3. **Semantic Mapper**: Translates AST into SQL-ready specs using mappings and patterns.
-4. **DSL Builder**: Generates a compact intermediate DSL string.
+### Architecture Overview
+CompTech follows a classic compiler pipeline with six phases:
+1. **Lexer (NLLexer)**: Tokenizes input English text into keywords, identifiers, strings, numbers, commas, and periods.
+2. **Parser (LL1Parser)**: Builds an Abstract Syntax Tree (AST) for NL statements using LL(1) parsing.
+3. **Semantic Mapper**: Translates AST into SQL-ready specifications using mapping tables and attribute patterns.
+4. **DSL Builder**: Generates a compact intermediate Domain-Specific Language (DSL) string.
 5. **LALR Parser**: Validates and re-parses the DSL into an executable SQL AST.
-6. **Code Generator**: Outputs final SQL strings.
+6. **Code Generator**: Renders the final SQL string from the AST.
 
-This design ensures robustness and makes debugging a breeze!
+This modular design ensures robustness, debuggability, and ease of extension.
 
-## 🚀 How to Run
+## 🚀 Installation and Setup
 
 ### Prerequisites
 - **Python 3.8+** (tested on 3.13).
-- **Tkinter** (usually included with Python; if not, install via `pip install tk` or your package manager).
-- No other dependencies—pure Python magic!
+- **Streamlit** (install via `pip install streamlit` or use the provided `requirements.txt`).
 
-### Installation & Setup
-1. Clone or download the repository.
-2. Navigate to the project folder: `cd Final_project`.
-3. Run the script: `python CompTech.py`.
+### Steps
+1. Clone or download the repository to your local machine.
+2. Open a terminal and navigate to the project folder: `cd Final_project`.
+3. Install dependencies: `pip install -r requirements.txt`
+4. Run the Streamlit app: `streamlit run CompTech.py`
 
-That's it! The GUI window will pop up. If it doesn't (e.g., in headless environments), check your display setup.
+The Streamlit web interface will open automatically in your default browser at `http://localhost:8501`. If it doesn't open automatically, navigate to that URL manually.
 
-### Usage
-- **Enter Queries**: Type natural language in the input box (e.g., "Show me all customer names.").
-- **Compile**: Click "Compile" to see DSL, SQL, and recommendations.
-- **Examples**: Click "Examples" for sample queries.
-- **Clear**: Reset the interface.
-- **Scroll**: Use the scrollbar for long outputs.
+## 🖥️ User Interface Guide
 
-## 📝 Example Queries
+The GUI is built with Streamlit for a modern web-based interface. Key components:
 
-Try these to see CompTech in action:
+### Main Interface
+- **Title**: "🔍 Natural Language → SQL Compiler" at the top.
+- **Sidebar**: 
+  - Lists supported SQL operations (SELECT, INSERT, DELETE, UPDATE, ORDER BY).
+  - Contains 5 example query buttons (Example 1-5) that load sample queries into the input area.
+- **Main Input Area**: Large text area for entering natural language queries.
+- **Action Buttons**:
+  - **🚀 Compile**: Processes the query and displays outputs.
+  - **🗑️ Clear**: Resets input field and clears all outputs.
 
-- **SELECT**: "Get the names and emails of customers who live in Jakarta."
-- **INSERT**: "Insert a new record into customers with name Sarah and status Active."
-- **DELETE**: "Delete the records from customers who live in Jakarta."
-- **UPDATE**: "Update the customers with status Active where city is Jakarta."
-- **Advanced**: "Show me the top 5 most expensive products ordered by price descending."
+### Output Sections
+- **🔷 DSL (Intermediate Representation)**: Shows the intermediate DSL representation (collapsed by default).
+- **💾 Generated SQL**: Displays the generated executable SQL statement (expanded by default).
+- **💡 Recommendations**: Lists suggestions for query improvements or corrections (collapsed by default).
 
-Output includes:
-- **DSL**: Intermediate representation.
-- **SQL**: Executable query (e.g., `SELECT name, email FROM customers WHERE city = 'Jakarta';`).
-- **Recommendations**: Suggestions for typos or unmapped terms.
+### 🔬 Compiler Phases & Debug Information
+A comprehensive debug section (collapsed by default) that provides detailed insights into the compilation process through 7 tabs:
 
-## 🧪 Limitations
+1. **📝 Input/Output**: Shows original input, enhanced text (after recommendations), final SQL output, and a console-style execution log.
+2. **🔤 Tokens**: Displays the complete token stream from lexical analysis with token statistics.
+3. **🌳 NL AST**: Shows the Natural Language Abstract Syntax Tree (JSON format) generated by the LL(1) parser.
+4. **🔷 DSL Spec**: Displays the DSL specification (JSON format) created by semantic mapping, plus the DSL script.
+5. **🌲 SQL AST**: Shows the SQL Abstract Syntax Tree (JSON format) generated by the LALR parser.
+6. **📚 Grammar**: Lists grammar information including keywords, production rules, and parser types.
+7. **📊 Parser Info**: Provides detailed information about LL(1) and LALR(1) parsers, their methods, and compilation phases.
+
+This debug section is perfect for:
+- **Educational purposes**: Understanding how compilers work
+- **Debugging**: Identifying issues in the compilation pipeline
+- **Learning**: Seeing intermediate representations at each phase
+
+The interface is intuitive—enter a query, click compile, and view results instantly. The web-based interface works on any device with a browser and can be easily deployed to cloud platforms.
+
+## 📝 Supported Queries and Syntax
+
+CompTech supports a restricted natural language grammar for database operations. Queries must follow specific patterns; unsupported syntax may result in errors.
+
+### Query Types
+- **SELECT**: Retrieve data (e.g., "Get the names and emails of customers who live in Jakarta.").
+- **INSERT**: Add new records (e.g., "Insert a new record into customers with name Sarah and status Active.").
+- **DELETE**: Remove records (e.g., "Delete the records from customers who live in Jakarta.").
+- **UPDATE**: Modify records (e.g., "Update the customers with status Active where city is Jakarta.").
+
+### Clauses and Modifiers
+- **WHERE**: Conditions like "who live in Jakarta" (maps to `city = 'Jakarta'`).
+- **ORDER BY**: Sorting, e.g., "ordered by price descending" or "alphabetically".
+- **DISTINCT**: Unique results, e.g., "unique customer names".
+- **LIMIT/OFFSET**: Pagination, e.g., "top 5" or "page 2 with 20 per page".
+- **Direction Phrases**: "oldest to newest", "highest to lowest", "alphabetically" for implicit ORDER BY.
+
+### Mapping Rules
+- **Tables**: Predefined mappings (e.g., "customers" → "Customers", "orders" → "Orders").
+- **Columns**: Business terms map to schema (e.g., "name" → "name", "email address" → "email", "job title" → "job_title").
+- **Conditions**: Patterns like "live in [city]" → `city = '[city]'`, "have status [value]" → `status = '[value]'`.
+- **Literals**: Strings in quotes, numbers as-is; auto-escapes and formats.
+
+Unsupported: Joins, aggregations (GROUP BY, SUM), subqueries, or custom schemas beyond predefined ones.
+
+## 📋 Step-by-Step Usage Instructions
+
+1. **Launch the Program**: Run `streamlit run CompTech.py` in your terminal. The web interface will open in your browser.
+2. **Enter a Query**: Type a natural language query in the input text area (e.g., "Show me all customer names.").
+   - **Tip**: Click any "Example 1-5" button in the sidebar to load a sample query automatically.
+3. **Compile**: Click the "🚀 Compile" button. The program processes the query through its pipeline.
+4. **View Outputs**:
+   - **DSL**: Expand the DSL section to review the intermediate representation (e.g., "SELECT TABLE customers COLUMNS name").
+   - **SQL**: View the generated SQL in the expanded SQL section (e.g., `SELECT name FROM Customers;`).
+   - **Recommendations**: Expand the Recommendations section if suggestions appear.
+5. **Explore Debug Information** (Optional):
+   - Scroll down and expand the "🔬 Compiler Phases & Debug Information" section.
+   - Navigate through the 7 tabs to see:
+     - Token stream and statistics
+     - Natural Language AST structure
+     - DSL specification and script
+     - SQL AST structure
+     - Grammar rules and parser information
+     - Console-style execution log
+6. **Use Examples**: Click any "Example" button in the sidebar to load sample queries into the input area.
+7. **Clear and Retry**: Click "🗑️ Clear" to reset the input and clear all outputs; repeat for new queries.
+8. **Exit**: Close the browser tab or stop the Streamlit server (Ctrl+C in terminal).
 
 
-- **Limitations**: No support for complex joins, subqueries, or custom tables yet. Errors occur for unsupported syntax—check recommendations!
+## 🔍 Output and Error Handling
 
+### Main Outputs
+- **DSL**: Compact intermediate language (e.g., "SELECT TABLE customers COLUMNS name WHERE city = 'Jakarta'"). Useful for debugging pipeline stages.
+- **SQL**: Final executable statement (e.g., `SELECT name FROM Customers WHERE city = 'Jakarta';`). Ready for database execution (e.g., in SQLite, MySQL).
+- **Recommendations**: List of suggested replacements for unrecognized words (e.g., "Did you mean 'customers' instead of 'custmrs'?"). Empty if no issues.
+
+### Debug Outputs (Compiler Phases Section)
+When you expand the "🔬 Compiler Phases & Debug Information" section, you can view:
+
+- **Input/Output Tab**:
+  - Original input text
+  - Enhanced text (after automatic corrections)
+  - Final SQL output
+  - Console-style execution log showing all compilation phases
+
+- **Tokens Tab**:
+  - Complete token stream with token types (KEYWORD, IDENTIFIER, STRING, NUMBER, etc.)
+  - Token statistics showing count of each token type
+
+- **NL AST Tab**:
+  - Natural Language Abstract Syntax Tree in JSON format
+  - Shows the structure parsed by the LL(1) parser
+
+- **DSL Spec Tab**:
+  - DSL specification in JSON format (semantic mapping output)
+  - DSL script (textual representation)
+
+- **SQL AST Tab**:
+  - SQL Abstract Syntax Tree in JSON format
+  - Shows the structure parsed by the LALR parser
+
+- **Grammar Tab**:
+  - Complete list of keywords for both NL and DSL grammars
+  - Production rules for the grammar
+  - Parser type information
+
+- **Parser Info Tab**:
+  - Detailed information about LL(1) and LALR(1) parsers
+  - Explanation of parsing methods
+  - Overview of all compilation phases
+
+### Errors
+- **Syntax Errors**: Invalid grammar displays an error message in the Streamlit interface with details (e.g., "Expected select introducer, found...").
+- **Mapping Errors**: Unrecognized terms show recommendations; query may still compile with fallbacks.
+- **Runtime Errors**: Displayed in the Streamlit interface with full stack traces for debugging.
+- **GUI Issues**: If the browser doesn't open, manually navigate to `http://localhost:8501`; ensure Streamlit is installed.
+
+Errors halt compilation; fix based on recommendations and retry.
+
+## 🛠️ Troubleshooting and Tips
+
+### Common Issues
+- **Query Not Recognized**: Check grammar against examples; use recommendations for typos.
+- **No Output**: Ensure query ends with a period; avoid unsupported features.
+- **Streamlit Won't Launch**: Ensure Streamlit is installed (`pip install streamlit`); check that port 8501 is available.
+- **Browser Doesn't Open**: Manually navigate to `http://localhost:8501` after running `streamlit run CompTech.py`.
+- **Mapping Fails**: Add custom mappings in `SYSTEMATIC_MAPPING_TABLE` or `ATTRIBUTE_PATTERNS` in code.
+- **Performance**: For long queries, processing is fast; the web interface handles large inputs efficiently.
+
+### Tips
+- Start with simple queries; build complexity.
+- Use "Example" buttons in the sidebar for inspiration.
+- **Explore the Debug Section**: Use the "Compiler Phases & Debug Information" section to understand how the compiler works internally. This is especially useful for learning compiler concepts.
+- **Learn from ASTs**: The AST views show exactly how your query is parsed and transformed at each stage.
+- For extensibility: Edit `SYSTEMATIC_MAPPING_TABLE` for new tables/columns, `ATTRIBUTE_PATTERNS` for conditions.
+- Test with `test_compile.py` or `test_parse.py` for pipeline validation.
+- No database connection: Outputs are strings; execute SQL separately.
+
+### Limitations
+- Restricted to predefined schemas; no custom tables without code changes.
+- No complex SQL (joins, subqueries, aggregations).
+- Case-sensitive for exact matches; recommendations help with variations.
+
+## 📚 Appendices
+
+### Full Example Queries
+- SELECT: "Get the names and emails of customers who live in Jakarta." → SQL: `SELECT name, email FROM Customers WHERE city = 'Jakarta';`
+- INSERT: "Insert a new record into customers with name Sarah and status Active." → SQL: `INSERT INTO Customers (name, status) VALUES ('Sarah', 'Active');`
+- DELETE: "Delete the records from customers who live in Jakarta." → SQL: `DELETE FROM Customers WHERE city = 'Jakarta';`
+- UPDATE: "Update the customers with status Active where city is Jakarta." → SQL: `UPDATE Customers SET status = 'Active' WHERE city = 'Jakarta';`
+- Advanced SELECT: "Show the top 5 most expensive products ordered by price descending." → SQL: `SELECT product_name, price FROM products ORDER BY price DESC LIMIT 5;`
+
+### Predefined Schema Mappings
+- **Tables**: customers → Customers, orders → Orders, employees → Employees, students → Students, books → Books.
+- **Columns**: name → name, email → email, job_title → job_title, product_name → product_name, price → price, city → city, status → status, etc.
+- **Patterns**: "live in [place]" → `city = '[place]'`, "are from [country]" → `country = '[country]'`.
+
+### Compiler Architecture Details
+
+The debug section provides visibility into the six-phase compilation pipeline:
+
+1. **Lexical Analysis (Tokenization)**: Converts input text into tokens
+   - View in: Tokens tab
+   - Implementation: `NLLexer` class
+
+2. **Syntax Analysis (LL(1) Parsing)**: Builds Natural Language AST
+   - View in: NL AST tab
+   - Implementation: `LL1Parser` class
+
+3. **Semantic Analysis (Mapping)**: Translates NL AST to DSL specification
+   - View in: DSL Spec tab
+   - Implementation: `SemanticMapper` class
+
+4. **DSL Generation**: Converts DSL spec to DSL script
+   - View in: DSL Spec tab
+   - Implementation: `DSLBuilder` class
+
+5. **DSL Parsing (LALR)**: Parses DSL script to SQL AST
+   - View in: SQL AST tab
+   - Implementation: `DSLParser` and `LALRParserEngine` classes
+
+6. **Code Generation**: Converts SQL AST to SQL string
+   - View in: SQL tab (main output)
+   - Implementation: `CodeGenerator` class
