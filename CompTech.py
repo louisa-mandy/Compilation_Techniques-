@@ -2274,7 +2274,7 @@ def get_grammar_info() -> str:
 
 def main() -> None:
     st.set_page_config(
-        page_title="NL to SQL Compiler",
+        page_title="NLP to SQL: Translation Engine Using RuleBased and Parsing Techniques",
         page_icon="🔍",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -2287,7 +2287,7 @@ def main() -> None:
     compiler = st.session_state.compiler
     
     # Title
-    st.title("🔍 Natural Language → SQL Compiler")
+    st.title("🔍 NLP to SQL: Translation Engine Using RuleBased and Parsing Techniques")
     st.markdown("---")
     
     # Sidebar with instructions and examples
@@ -2307,7 +2307,7 @@ def main() -> None:
             "Insert a new record into customers with name Sarah and status Active.",
             "Delete the records from customers who live in Jakarta.",
             "Update the customers with status Active where city is Jakarta.",
-            "Show the top 5 most expensive products ordered by price descending."
+            "Sort employees by hire date from oldest to newest"
         ]
         
         # Initialize query_text in session state if not present
