@@ -6,13 +6,15 @@ of English requests (e.g., “Get the names and emails of customers who live in
 Jakarta”) into SQL SELECT/INSERT statements. Each classical compiler phase is made
 explicit so the flow is easy to follow and extend:
 
-1. Lexer            – tokenises free-form English text.
-2. Parser (LL(1))   – produces an abstract syntax tree (AST) for the NL query.
-3. Semantic Mapping – uses a systematic mapping table + patterns to interpret
+1. Lexer            - tokenises free-form English text.
+2. Parser (LL(1))   - produces an abstract syntax tree (AST) for the NL query.
+3. Semantic Mapping - uses a systematic mapping table + patterns to interpret
                       business terminology as concrete SQL schema elements.
-4. DSL Builder      – emits a compact DSL that captures the interpreted intent.
-5. LALR Parser      – validates DSL and rehydrates an executable SQL AST.
-6. Code Generator   – renders the final AST into executable SQL.
+4. DSL Builder      - emits a compact DSL that captures the interpreted intent.
+5. LALR Parser      - validates DSL and rehydrates an executable SQL AST.
+6. Semantic Analysis - validates queries using symbol table, detects semantic errors,
+                      and produces an annotated AST with type and metadata information.
+7. Code Generator   - renders the final AST into executable SQL.
 
 The implementation is intentionally compact yet showcases how compiler ideas
 apply outside traditional programming languages.
@@ -21,10 +23,12 @@ apply outside traditional programming languages.
 from __future__ import annotations
 
 import difflib
+import json
+import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import streamlit as st
 
@@ -152,6 +156,18 @@ class NLLexer:
         upper_word = word.upper()
         if upper_word in self.KEYWORDS:
             return Token(TokenType.KEYWORD, upper_word)
+
+        # Suggestion-only typo handling: if the word is close to a keyword,
+        # raise a LexicalError with a suggestion to help the user correct typos.
+        try:
+            suggestion = difflib.get_close_matches(upper_word, self.KEYWORDS, n=1, cutoff=0.8)
+        except Exception:
+            suggestion = []
+        if suggestion:
+            raise LexicalError(
+                f"Unknown keyword '{word}'. Did you mean '{suggestion[0]}'?"
+            )
+
         return Token(TokenType.IDENTIFIER, word)
 
     def _consume_string(self, quote: str) -> Token:
@@ -287,6 +303,59 @@ class DSLSelectSpec:
             self.order_clauses = []
 
 
+# --- Intermediate Representation (IR) for DSL (tree form) -----------------
+
+
+@dataclass
+class IRCondition:
+    column: str
+    operator: str
+    literal: str
+    connector: Optional[str] = None
+
+
+@dataclass
+class IRSelect:
+    projections: List[str]
+    table: str
+    conditions: List[IRCondition]
+    distinct: bool = False
+    order_clauses: List[tuple[str, bool]] = None
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+
+    def __post_init__(self):
+        if self.order_clauses is None:
+            self.order_clauses = []
+
+
+IRStatement = IRSelect
+
+
+@dataclass
+class IRInsert:
+    table: str
+    columns: List[str]
+    values: List[str]
+
+
+@dataclass
+class IRDelete:
+    table: str
+    conditions: List[IRCondition]
+
+
+@dataclass
+class IRUpdate:
+    table: str
+    assignments: List[tuple[str, str]]
+    conditions: List[IRCondition]
+
+
+IRStatement = IRSelect | IRInsert | IRDelete | IRUpdate
+
+
+
 @dataclass
 class DSLInsertSpec:
     table: str
@@ -312,6 +381,799 @@ DSLStatementSpec = DSLSelectSpec | DSLInsertSpec | DSLDeleteSpec | DSLUpdateSpec
 SQLStatement = SQLSelect | SQLInsert | SQLDelete | SQLUpdate
 
 
+# --------------------------------------------------------------------------- #
+# Semantic Error Handling
+# --------------------------------------------------------------------------- #
+
+
+class SemanticError(Exception):
+    """Base class for semantic errors (errors in meaning, not syntax)."""
+    
+    def __init__(self, message: str, location: Optional[str] = None):
+        super().__init__(message)
+        self.message = message
+        self.location = location
+    
+    def __str__(self) -> str:
+        if self.location:
+            return f"Semantic Error at {self.location}: {self.message}"
+        return f"Semantic Error: {self.message}"
+
+
+class UnknownColumnError(SemanticError):
+    """Raised when a column is referenced but doesn't exist in any table."""
+    
+    def __init__(self, column: str, table: Optional[str] = None, location: Optional[str] = None):
+        if table:
+            message = f"Column '{column}' does not exist in table '{table}'"
+        else:
+            message = f"Column '{column}' does not exist in any known table"
+        super().__init__(message, location)
+        self.column = column
+        self.table = table
+
+
+class AmbiguousColumnError(SemanticError):
+    """Raised when a column name is ambiguous (exists in multiple tables)."""
+    
+    def __init__(self, column: str, tables: List[str], location: Optional[str] = None):
+        tables_str = ", ".join(tables)
+        message = f"Column '{column}' is ambiguous - exists in multiple tables: {tables_str}"
+        super().__init__(message, location)
+        self.column = column
+        self.tables = tables
+
+
+class UnknownTableError(SemanticError):
+    """Raised when a table is referenced but doesn't exist."""
+    
+    def __init__(self, table: str, location: Optional[str] = None):
+        message = f"Table '{table}' does not exist"
+        super().__init__(message, location)
+        self.table = table
+
+
+class TypeMismatchError(SemanticError):
+    """Raised when there's a type mismatch in operations."""
+    
+    def __init__(self, expected_type: str, actual_type: str, context: str, location: Optional[str] = None):
+        message = f"Type mismatch in {context}: expected {expected_type}, got {actual_type}"
+        super().__init__(message, location)
+        self.expected_type = expected_type
+        self.actual_type = actual_type
+        self.context = context
+
+
+class InvalidOperationError(SemanticError):
+    """Raised when an operation is invalid for the given types."""
+    
+    def __init__(self, operation: str, details: str, location: Optional[str] = None):
+        message = f"Invalid operation '{operation}': {details}"
+        super().__init__(message, location)
+        self.operation = operation
+        self.details = details
+
+
+class LexicalError(Exception):
+    """Raised for lexical/tokenization errors, such as unknown keywords.
+
+    This error may include a suggestion when a close keyword match is found.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"Lexical Error: {self.message}"
+
+
+# --------------------------------------------------------------------------- #
+# Symbol Table
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ColumnInfo:
+    """Information about a database column."""
+    name: str
+    table: str
+    data_type: str  # e.g., "VARCHAR", "INTEGER", "DECIMAL", "DATE"
+    nullable: bool = True
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            object.__setattr__(self, 'metadata', {})
+
+
+@dataclass(frozen=True)
+class TableInfo:
+    """Information about a database table."""
+    name: str
+    columns: Dict[str, ColumnInfo]  # column_name -> ColumnInfo
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            object.__setattr__(self, 'metadata', {})
+
+
+class SymbolTable:
+    """Tracks tables, columns, and their relationships for semantic validation."""
+    
+    def __init__(self):
+        self._tables: Dict[str, TableInfo] = {}
+        self._column_to_tables: Dict[str, List[str]] = {}  # column_name -> [table_names]
+    
+    def register_table(self, table: TableInfo) -> None:
+        """Register a table and its columns in the symbol table."""
+        self._tables[table.name.lower()] = table
+        
+        # Update column-to-tables mapping
+        for column_name in table.columns:
+            col_lower = column_name.lower()
+            if col_lower not in self._column_to_tables:
+                self._column_to_tables[col_lower] = []
+            if table.name.lower() not in self._column_to_tables[col_lower]:
+                self._column_to_tables[col_lower].append(table.name.lower())
+    
+    def get_table(self, table_name: str) -> Optional[TableInfo]:
+        """Get table information by name (case-insensitive)."""
+        return self._tables.get(table_name.lower())
+    
+    def table_exists(self, table_name: str) -> bool:
+        """Check if a table exists."""
+        return table_name.lower() in self._tables
+    
+    def get_column(self, column_name: str, table_name: Optional[str] = None) -> Optional[ColumnInfo]:
+        """Get column information.
+        
+        If table_name is provided, returns the column from that specific table.
+        If table_name is None, returns the column if it's unambiguous (exists in exactly one table).
+        Raises AmbiguousColumnError if the column exists in multiple tables.
+        """
+        col_lower = column_name.lower()
+        
+        if table_name:
+            table = self.get_table(table_name)
+            if table:
+                return table.columns.get(col_lower)
+            return None
+        
+        # Check if column exists in any table
+        tables_with_column = self._column_to_tables.get(col_lower, [])
+        
+        if not tables_with_column:
+            return None
+        
+        if len(tables_with_column) == 1:
+            table = self._tables[tables_with_column[0]]
+            return table.columns.get(col_lower)
+        
+        # Ambiguous - exists in multiple tables
+        return None
+    
+    def find_column_tables(self, column_name: str) -> List[str]:
+        """Find all tables that contain a given column."""
+        return self._column_to_tables.get(column_name.lower(), []).copy()
+    
+    def validate_column_reference(self, column_name: str, table_name: Optional[str] = None) -> ColumnInfo:
+        """Validate a column reference and return its info.
+        
+        Raises:
+            UnknownColumnError: if column doesn't exist
+            AmbiguousColumnError: if column exists in multiple tables and table_name not provided
+        """
+        if table_name:
+            if not self.table_exists(table_name):
+                raise UnknownTableError(table_name)
+            column = self.get_column(column_name, table_name)
+            if not column:
+                raise UnknownColumnError(column_name, table_name)
+            return column
+        
+        # No table specified - check for ambiguity
+        tables_with_column = self.find_column_tables(column_name)
+        
+        if not tables_with_column:
+            raise UnknownColumnError(column_name)
+        
+        if len(tables_with_column) > 1:
+            raise AmbiguousColumnError(column_name, tables_with_column)
+        
+        # Unambiguous - get from the single table
+        column = self.get_column(column_name, tables_with_column[0])
+        if not column:
+            raise UnknownColumnError(column_name)
+        return column
+    
+    def get_all_tables(self) -> List[str]:
+        """Get list of all registered table names."""
+        return list(self._tables.keys())
+
+
+def create_default_symbol_table() -> SymbolTable:
+    """Create a symbol table with default schema information."""
+    symtab = SymbolTable()
+    
+    # Customers table
+    customers_columns = {
+        "customer_id": ColumnInfo("customer_id", "Customers", "INTEGER", False),
+        "customer_name": ColumnInfo("customer_name", "Customers", "VARCHAR", False),
+        "name": ColumnInfo("name", "Customers", "VARCHAR", True),
+        "email": ColumnInfo("email", "Customers", "VARCHAR", True),
+        "phone": ColumnInfo("phone", "Customers", "VARCHAR", True),
+        "city": ColumnInfo("city", "Customers", "VARCHAR", True),
+        "country": ColumnInfo("country", "Customers", "VARCHAR", True),
+        "status": ColumnInfo("status", "Customers", "VARCHAR", True),
+    }
+    symtab.register_table(TableInfo("Customers", customers_columns))
+    
+    # Employees table
+    employees_columns = {
+        "employee_id": ColumnInfo("employee_id", "Employees", "INTEGER", False),
+        "employee_name": ColumnInfo("employee_name", "Employees", "VARCHAR", False),
+        "name": ColumnInfo("name", "Employees", "VARCHAR", True),
+        "job_title": ColumnInfo("job_title", "Employees", "VARCHAR", True),
+        "hire_date": ColumnInfo("hire_date", "Employees", "DATE", True),
+        "email": ColumnInfo("email", "Employees", "VARCHAR", True),
+        "city": ColumnInfo("city", "Employees", "VARCHAR", True),
+    }
+    symtab.register_table(TableInfo("Employees", employees_columns))
+    
+    # Students table
+    students_columns = {
+        "student_id": ColumnInfo("student_id", "Students", "INTEGER", False),
+        "student_name": ColumnInfo("student_name", "Students", "VARCHAR", False),
+        "name": ColumnInfo("name", "Students", "VARCHAR", True),
+        "gpa": ColumnInfo("gpa", "Students", "DECIMAL", True),
+        "email": ColumnInfo("email", "Students", "VARCHAR", True),
+    }
+    symtab.register_table(TableInfo("Students", students_columns))
+    
+    # Books table
+    books_columns = {
+        "book_id": ColumnInfo("book_id", "Books", "INTEGER", False),
+        "title": ColumnInfo("title", "Books", "VARCHAR", False),
+        "author": ColumnInfo("author", "Books", "VARCHAR", True),
+        "product_name": ColumnInfo("product_name", "Books", "VARCHAR", True),
+    }
+    symtab.register_table(TableInfo("Books", books_columns))
+    
+    # Orders table
+    orders_columns = {
+        "order_id": ColumnInfo("order_id", "Orders", "INTEGER", False),
+        "customer_id": ColumnInfo("customer_id", "Orders", "INTEGER", True),
+        "order_date": ColumnInfo("order_date", "Orders", "DATE", True),
+        "status": ColumnInfo("status", "Orders", "VARCHAR", True),
+    }
+    symtab.register_table(TableInfo("Orders", orders_columns))
+    
+    # Products table (if referenced)
+    products_columns = {
+        "product_id": ColumnInfo("product_id", "Products", "INTEGER", False),
+        "product_name": ColumnInfo("product_name", "Products", "VARCHAR", False),
+        "price": ColumnInfo("price", "Products", "DECIMAL", True),
+    }
+    symtab.register_table(TableInfo("Products", products_columns))
+    
+    return symtab
+
+
+def load_schema_from_json(json_data: Union[str, Dict[str, Any]]) -> SymbolTable:
+    """Load a symbol table from a JSON schema definition.
+    
+    JSON Format:
+    {
+        "tables": [
+            {
+                "name": "TableName",
+                "columns": [
+                    {
+                        "name": "column_name",
+                        "data_type": "VARCHAR" | "INTEGER" | "DECIMAL" | "DATE" | etc.,
+                        "nullable": true | false,
+                        "metadata": {}  // optional
+                    }
+                ],
+                "metadata": {}  // optional
+            }
+        ]
+    }
+    
+    Args:
+        json_data: JSON string or dictionary containing schema definition
+        
+    Returns:
+        SymbolTable populated with the schema
+        
+    Raises:
+        ValueError: If JSON is invalid or schema structure is incorrect
+    """
+    # Parse JSON if string
+    if isinstance(json_data, str):
+        try:
+            schema = json.loads(json_data)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format: {e}")
+    else:
+        schema = json_data
+    
+    # Validate schema structure
+    if not isinstance(schema, dict):
+        raise ValueError("Schema must be a JSON object")
+    
+    if "tables" not in schema:
+        raise ValueError("Schema must contain a 'tables' array")
+    
+    if not isinstance(schema["tables"], list):
+        raise ValueError("'tables' must be an array")
+    
+    # Create symbol table
+    symtab = SymbolTable()
+    
+    # Process each table
+    for table_def in schema["tables"]:
+        if not isinstance(table_def, dict):
+            raise ValueError("Each table definition must be an object")
+        
+        if "name" not in table_def:
+            raise ValueError("Table definition must have a 'name' field")
+        
+        if "columns" not in table_def:
+            raise ValueError(f"Table '{table_def['name']}' must have a 'columns' array")
+        
+        if not isinstance(table_def["columns"], list):
+            raise ValueError(f"Table '{table_def['name']}' columns must be an array")
+        
+        table_name = str(table_def["name"])
+        table_metadata = table_def.get("metadata", {})
+        
+        # Process columns
+        columns: Dict[str, ColumnInfo] = {}
+        for col_def in table_def["columns"]:
+            if not isinstance(col_def, dict):
+                raise ValueError(f"Column definition in table '{table_name}' must be an object")
+            
+            if "name" not in col_def:
+                raise ValueError(f"Column in table '{table_name}' must have a 'name' field")
+            
+            if "data_type" not in col_def:
+                raise ValueError(f"Column '{col_def['name']}' in table '{table_name}' must have a 'data_type' field")
+            
+            col_name = str(col_def["name"])
+            data_type = str(col_def["data_type"])
+            nullable = col_def.get("nullable", True)
+            col_metadata = col_def.get("metadata", {})
+            
+            column_info = ColumnInfo(
+                name=col_name,
+                table=table_name,
+                data_type=data_type,
+                nullable=nullable,
+                metadata=col_metadata
+            )
+            columns[col_name] = column_info
+        
+        # Register table
+        table_info = TableInfo(
+            name=table_name,
+            columns=columns,
+            metadata=table_metadata
+        )
+        symtab.register_table(table_info)
+    
+    return symtab
+
+
+def export_schema_to_json(symbol_table: SymbolTable) -> str:
+    """Export a symbol table to JSON format.
+    
+    Args:
+        symbol_table: The symbol table to export
+        
+    Returns:
+        JSON string representation of the schema
+    """
+    schema = {
+        "tables": []
+    }
+    
+    for table_name in symbol_table.get_all_tables():
+        table_info = symbol_table.get_table(table_name)
+        if not table_info:
+            continue
+        
+        table_def = {
+            "name": table_info.name,
+            "columns": [],
+            "metadata": table_info.metadata or {}
+        }
+        
+        for col_name, col_info in table_info.columns.items():
+            col_def = {
+                "name": col_info.name,
+                "data_type": col_info.data_type,
+                "nullable": col_info.nullable,
+                "metadata": col_info.metadata or {}
+            }
+            table_def["columns"].append(col_def)
+        
+        schema["tables"].append(table_def)
+    
+    return json.dumps(schema, indent=2)
+
+
+def create_default_schema_json() -> str:
+    """Create a JSON representation of the default schema (for reference/export)."""
+    default_symtab = create_default_symbol_table()
+    return export_schema_to_json(default_symtab)
+
+
+def get_schema_format_example() -> str:
+    """Get an example JSON schema format for documentation."""
+    example = {
+        "tables": [
+            {
+                "name": "Customers",
+                "columns": [
+                    {
+                        "name": "customer_id",
+                        "data_type": "INTEGER",
+                        "nullable": False,
+                        "metadata": {}
+                    },
+                    {
+                        "name": "customer_name",
+                        "data_type": "VARCHAR",
+                        "nullable": False,
+                        "metadata": {}
+                    },
+                    {
+                        "name": "email",
+                        "data_type": "VARCHAR",
+                        "nullable": True,
+                        "metadata": {}
+                    },
+                    {
+                        "name": "city",
+                        "data_type": "VARCHAR",
+                        "nullable": True,
+                        "metadata": {}
+                    }
+                ],
+                "metadata": {}
+            }
+        ]
+    }
+    return json.dumps(example, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# Annotated AST
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class AnnotatedColumn:
+    """An annotated column reference with type and source table information."""
+    name: str
+    source_table: Optional[str] = None
+    column_info: Optional[ColumnInfo] = None
+    data_type: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+        if self.column_info and not self.data_type:
+            self.data_type = self.column_info.data_type
+        if self.column_info and not self.source_table:
+            self.source_table = self.column_info.table
+
+
+@dataclass
+class AnnotatedCondition:
+    """An annotated condition with type information."""
+    left: AnnotatedColumn
+    operator: str
+    right: str  # literal value
+    right_type: Optional[str] = None
+    connector: Optional[str] = None
+    next_condition: Optional["AnnotatedCondition"] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
+class AnnotatedSelect:
+    """An annotated SELECT statement with semantic information."""
+    columns: List[AnnotatedColumn]
+    table: str
+    table_info: Optional[TableInfo] = None
+    where: Optional[AnnotatedCondition] = None
+    distinct: bool = False
+    order_clauses: List[tuple[AnnotatedColumn, bool]] = None
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.order_clauses is None:
+            self.order_clauses = []
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
+class AnnotatedInsert:
+    """An annotated INSERT statement with semantic information."""
+    table: str
+    assignments: List[tuple[AnnotatedColumn, str]]  # (column, value)
+    table_info: Optional[TableInfo] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
+class AnnotatedDelete:
+    """An annotated DELETE statement with semantic information."""
+    table: str
+    table_info: Optional[TableInfo] = None
+    where: Optional[AnnotatedCondition] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
+class AnnotatedUpdate:
+    """An annotated UPDATE statement with semantic information."""
+    table: str
+    assignments: List[tuple[AnnotatedColumn, str]]  # (column, value)
+    table_info: Optional[TableInfo] = None
+    where: Optional[AnnotatedCondition] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+AnnotatedStatement = AnnotatedSelect | AnnotatedInsert | AnnotatedDelete | AnnotatedUpdate
+
+
+# --------------------------------------------------------------------------- #
+# Semantic Analyzer
+# --------------------------------------------------------------------------- #
+
+
+class SemanticAnalyzer:
+    """Performs semantic analysis on AST nodes using the symbol table."""
+    
+    def __init__(self, symbol_table: SymbolTable):
+        self.symbol_table = symbol_table
+    
+    def analyze(self, statement: SQLStatement) -> AnnotatedStatement:
+        """Analyze a SQL statement and return an annotated AST."""
+        if isinstance(statement, SQLSelect):
+            return self._analyze_select(statement)
+        if isinstance(statement, SQLInsert):
+            return self._analyze_insert(statement)
+        if isinstance(statement, SQLDelete):
+            return self._analyze_delete(statement)
+        if isinstance(statement, SQLUpdate):
+            return self._analyze_update(statement)
+        raise TypeError(f"Unsupported statement type: {type(statement).__name__}")
+    
+    def _analyze_select(self, select: SQLSelect) -> AnnotatedSelect:
+        """Analyze a SELECT statement."""
+        # Validate table exists
+        if not self.symbol_table.table_exists(select.table):
+            raise UnknownTableError(select.table)
+        
+        table_info = self.symbol_table.get_table(select.table)
+        
+        # Analyze columns
+        annotated_columns: List[AnnotatedColumn] = []
+        for col in select.columns:
+            if col == "*":
+                # Wildcard - create special annotation
+                annotated_columns.append(AnnotatedColumn(
+                    name="*",
+                    source_table=select.table,
+                    column_info=None,
+                    data_type=None
+                ))
+            else:
+                # Validate column exists in table
+                try:
+                    col_info = self.symbol_table.validate_column_reference(col, select.table)
+                    annotated_columns.append(AnnotatedColumn(
+                        name=col,
+                        source_table=select.table,
+                        column_info=col_info,
+                        data_type=col_info.data_type
+                    ))
+                except (UnknownColumnError, AmbiguousColumnError) as e:
+                    raise SemanticError(f"Invalid column '{col}' in SELECT: {e.message}")
+        
+        # Analyze WHERE clause
+        annotated_where = None
+        if select.where:
+            annotated_where = self._analyze_condition(select.where, select.table)
+        
+        # Analyze ORDER BY clauses
+        annotated_order: List[tuple[AnnotatedColumn, bool]] = []
+        for col_name, is_desc in select.order_clauses:
+            try:
+                col_info = self.symbol_table.validate_column_reference(col_name, select.table)
+                annotated_col = AnnotatedColumn(
+                    name=col_name,
+                    source_table=select.table,
+                    column_info=col_info,
+                    data_type=col_info.data_type
+                )
+                annotated_order.append((annotated_col, is_desc))
+            except (UnknownColumnError, AmbiguousColumnError) as e:
+                raise SemanticError(f"Invalid column '{col_name}' in ORDER BY: {e.message}")
+        
+        return AnnotatedSelect(
+            columns=annotated_columns,
+            table=select.table,
+            table_info=table_info,
+            where=annotated_where,
+            distinct=select.distinct,
+            order_clauses=annotated_order,
+            limit=select.limit,
+            offset=select.offset
+        )
+    
+    def _analyze_insert(self, insert: SQLInsert) -> AnnotatedInsert:
+        """Analyze an INSERT statement."""
+        # Validate table exists
+        if not self.symbol_table.table_exists(insert.table):
+            raise UnknownTableError(insert.table)
+        
+        table_info = self.symbol_table.get_table(insert.table)
+        
+        # Analyze column assignments
+        annotated_assignments: List[tuple[AnnotatedColumn, str]] = []
+        for col, value in zip(insert.columns, insert.values):
+            try:
+                col_info = self.symbol_table.validate_column_reference(col, insert.table)
+                annotated_col = AnnotatedColumn(
+                    name=col,
+                    source_table=insert.table,
+                    column_info=col_info,
+                    data_type=col_info.data_type
+                )
+                annotated_assignments.append((annotated_col, value))
+            except (UnknownColumnError, AmbiguousColumnError) as e:
+                raise SemanticError(f"Invalid column '{col}' in INSERT: {e.message}")
+        
+        return AnnotatedInsert(
+            table=insert.table,
+            assignments=annotated_assignments,
+            table_info=table_info
+        )
+    
+    def _analyze_delete(self, delete: SQLDelete) -> AnnotatedDelete:
+        """Analyze a DELETE statement."""
+        # Validate table exists
+        if not self.symbol_table.table_exists(delete.table):
+            raise UnknownTableError(delete.table)
+        
+        table_info = self.symbol_table.get_table(delete.table)
+        
+        # Analyze WHERE clause
+        annotated_where = None
+        if delete.where:
+            annotated_where = self._analyze_condition(delete.where, delete.table)
+        
+        return AnnotatedDelete(
+            table=delete.table,
+            table_info=table_info,
+            where=annotated_where
+        )
+    
+    def _analyze_update(self, update: SQLUpdate) -> AnnotatedUpdate:
+        """Analyze an UPDATE statement."""
+        # Validate table exists
+        if not self.symbol_table.table_exists(update.table):
+            raise UnknownTableError(update.table)
+        
+        table_info = self.symbol_table.get_table(update.table)
+        
+        # Analyze column assignments
+        annotated_assignments: List[tuple[AnnotatedColumn, str]] = []
+        for col, value in update.assignments:
+            try:
+                col_info = self.symbol_table.validate_column_reference(col, update.table)
+                annotated_col = AnnotatedColumn(
+                    name=col,
+                    source_table=update.table,
+                    column_info=col_info,
+                    data_type=col_info.data_type
+                )
+                annotated_assignments.append((annotated_col, value))
+            except (UnknownColumnError, AmbiguousColumnError) as e:
+                raise SemanticError(f"Invalid column '{col}' in UPDATE: {e.message}")
+        
+        # Analyze WHERE clause
+        annotated_where = None
+        if update.where:
+            annotated_where = self._analyze_condition(update.where, update.table)
+        
+        return AnnotatedUpdate(
+            table=update.table,
+            assignments=annotated_assignments,
+            table_info=table_info,
+            where=annotated_where
+        )
+    
+    def _analyze_condition(self, condition: SQLCondition, table_name: str) -> AnnotatedCondition:
+        """Analyze a condition chain."""
+        # Analyze left side (column)
+        try:
+            col_info = self.symbol_table.validate_column_reference(condition.left, table_name)
+            annotated_left = AnnotatedColumn(
+                name=condition.left,
+                source_table=table_name,
+                column_info=col_info,
+                data_type=col_info.data_type
+            )
+        except (UnknownColumnError, AmbiguousColumnError) as e:
+            raise SemanticError(f"Invalid column '{condition.left}' in condition: {e.message}")
+        
+        # Infer right side type (simple heuristic - could be enhanced)
+        right_type = self._infer_literal_type(condition.right)
+        
+        annotated_cond = AnnotatedCondition(
+            left=annotated_left,
+            operator=condition.operator,
+            right=condition.right,
+            right_type=right_type,
+            connector=condition.connector
+        )
+        
+        # Recursively analyze next condition
+        if condition.next_condition:
+            annotated_cond.next_condition = self._analyze_condition(condition.next_condition, table_name)
+        
+        return annotated_cond
+    
+    def _infer_literal_type(self, literal: str) -> str:
+        """Infer the type of a literal value."""
+        # Remove quotes if present
+        stripped = literal.strip()
+        if stripped.startswith("'") and stripped.endswith("'"):
+            return "VARCHAR"
+        if stripped.startswith('"') and stripped.endswith('"'):
+            return "VARCHAR"
+        
+        # Check if numeric
+        try:
+            float(stripped)
+            if '.' in stripped:
+                return "DECIMAL"
+            return "INTEGER"
+        except ValueError:
+            pass
+        
+        # Default to VARCHAR
+        return "VARCHAR"
+
+
 @dataclass
 class CompilerArtifacts:
     sql: str
@@ -329,8 +1191,17 @@ class CompilerDebugInfo:
     dsl_spec: DSLStatementSpec
     dsl_script: str
     sql_ast: SQLStatement
-    sql: str
-    recommendations: List[str]
+    annotated_ast: Optional[AnnotatedStatement] = None
+    semantic_errors: List[SemanticError] = None
+    sql: str = ""
+    recommendations: List[str] = None
+    vm_output: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.recommendations is None:
+            self.recommendations = []
+        if self.semantic_errors is None:
+            self.semantic_errors = []
 
 
 # --------------------------------------------------------------------------- #
@@ -1314,6 +2185,109 @@ class CodeGenerator:
         return " ".join(parts)
 
 
+class VirtualMachine:
+    """A simple virtual machine that simulates how the SQL AST would be executed.
+
+    This VM does NOT connect to a real database. Instead, it produces a
+    human-readable execution trace that explains how a typical SQL engine
+    would conceptually process the compiled statement.
+    """
+
+    def execute(self, ast: SQLStatement) -> str:
+        steps: List[str] = []
+
+        if isinstance(ast, SQLSelect):
+            steps.append("VM: BEGIN SELECT")
+            steps.append(f"  - Target table        : {ast.table}")
+
+            cols = ast.columns or ["*"]
+            steps.append(f"  - Project columns     : {', '.join(cols)}")
+
+            if ast.where:
+                steps.append("  - Apply filter (WHERE):")
+                for line in self._render_condition_steps(ast.where):
+                    steps.append(f"      {line}")
+            else:
+                steps.append("  - No WHERE filter (full table scan or index scan)")
+
+            if getattr(ast, "order_clauses", None):
+                order_desc: List[str] = []
+                for col, is_desc in ast.order_clauses:
+                    direction = "DESC" if is_desc else "ASC"
+                    order_desc.append(f"{col} {direction}")
+                if order_desc:
+                    steps.append(f"  - Sort rows (ORDER BY): {', '.join(order_desc)}")
+            else:
+                steps.append("  - No explicit ORDER BY (engine default ordering)")
+
+            if getattr(ast, "limit", None) is not None:
+                if getattr(ast, "offset", None) is not None:
+                    steps.append(
+                        f"  - Limit rows          : LIMIT {ast.limit} OFFSET {ast.offset}"
+                    )
+                else:
+                    steps.append(f"  - Limit rows          : LIMIT {ast.limit}")
+            elif getattr(ast, "offset", None) is not None:
+                steps.append(f"  - Offset rows         : OFFSET {ast.offset}")
+
+            steps.append("VM: END SELECT")
+            return "\n".join(steps)
+
+        if isinstance(ast, SQLInsert):
+            steps.append("VM: BEGIN INSERT")
+            steps.append(f"  - Target table        : {ast.table}")
+            cols = ast.columns or []
+            if cols:
+                steps.append(f"  - Columns             : {', '.join(cols)}")
+            else:
+                steps.append("  - Columns             : (all table columns in defined order)")
+            steps.append(f"  - Values              : {', '.join(ast.values)}")
+            steps.append("  - Action              : append new row to table")
+            steps.append("VM: END INSERT")
+            return "\n".join(steps)
+
+        if isinstance(ast, SQLDelete):
+            steps.append("VM: BEGIN DELETE")
+            steps.append(f"  - Target table        : {ast.table}")
+            if ast.where:
+                steps.append("  - Delete rows where   :")
+                for line in self._render_condition_steps(ast.where):
+                    steps.append(f"      {line}")
+            else:
+                steps.append("  - Delete ALL rows from table (no WHERE clause)")
+            steps.append("VM: END DELETE")
+            return "\n".join(steps)
+
+        if isinstance(ast, SQLUpdate):
+            steps.append("VM: BEGIN UPDATE")
+            steps.append(f"  - Target table        : {ast.table}")
+            if ast.where:
+                steps.append("  - Update rows where   :")
+                for line in self._render_condition_steps(ast.where):
+                    steps.append(f"      {line}")
+            else:
+                steps.append("  - Update ALL rows (no WHERE clause)")
+
+            if ast.assignments:
+                steps.append("  - Set columns         :")
+                for col, val in ast.assignments:
+                    steps.append(f"      {col} = {val}")
+            steps.append("VM: END UPDATE")
+            return "\n".join(steps)
+
+        return f"VM: Unsupported statement type: {type(ast).__name__}"
+
+    def _render_condition_steps(self, cond: SQLCondition) -> List[str]:
+        lines: List[str] = []
+        current = cond
+        while current:
+            lines.append(f"{current.left} {current.operator} {current.right}")
+            if current.connector and current.next_condition:
+                lines.append(f"[{current.connector}]")
+            current = current.next_condition
+        return lines
+
+
 # --------------------------------------------------------------------------- #
 # DSL Builder + LALR Parser
 # --------------------------------------------------------------------------- #
@@ -1322,7 +2296,30 @@ class CodeGenerator:
 class DSLBuilder:
     """Produces a deterministic DSL representation from interpreted NL statements."""
 
-    def build(self, spec: DSLStatementSpec) -> str:
+    def build(self, spec: Union[DSLStatementSpec, IRStatement]) -> str:
+        # Accept either DSL spec objects or IR tree nodes
+        if isinstance(spec, IRSelect):
+            # convert IRSelect back into a DSLSelectSpec-like rendering
+            dsl_spec = DSLSelectSpec(
+                columns=list(spec.projections),
+                table=spec.table,
+                conditions=[DSLConditionSpec(column=c.column, operator=c.operator, literal=c.literal, connector=c.connector) for c in spec.conditions],
+                distinct=spec.distinct,
+                order_clauses=list(spec.order_clauses),
+                limit=spec.limit,
+                offset=spec.offset,
+            )
+            return self._render_select(dsl_spec)
+        if isinstance(spec, IRInsert):
+            dsl_spec = DSLInsertSpec(table=spec.table, columns=list(spec.columns), values=list(spec.values))
+            return self._render_insert(dsl_spec)
+        if isinstance(spec, IRDelete):
+            conds = [DSLConditionSpec(column=c.column, operator=c.operator, literal=c.literal, connector=c.connector) for c in spec.conditions]
+            dsl_spec = DSLDeleteSpec(table=spec.table, conditions=conds)
+            return self._render_delete(dsl_spec)
+        if isinstance(spec, IRUpdate):
+            dsl_spec = DSLUpdateSpec(table=spec.table, assignments=list(spec.assignments), conditions=[DSLConditionSpec(column=c.column, operator=c.operator, literal=c.literal, connector=c.connector) for c in spec.conditions])
+            return self._render_update(dsl_spec)
         if isinstance(spec, DSLSelectSpec):
             return self._render_select(spec)
         if isinstance(spec, DSLInsertSpec):
@@ -2076,13 +3073,17 @@ class QueryRecommender:
 class NLToSQLCompiler:
     """Convenience façade tying all compiler phases together."""
 
-    def __init__(self) -> None:
+    def __init__(self, symbol_table: Optional[SymbolTable] = None) -> None:
         vocabulary = self._build_vocabulary()
         self.recommender = QueryRecommender(vocabulary)
         self.mapper = SemanticMapper(SYSTEMATIC_MAPPING_TABLE, ATTRIBUTE_PATTERNS)
         self.dsl_builder = DSLBuilder()
         self.dsl_parser = DSLParser()
+        self.optimizer = None
         self.generator = CodeGenerator()
+        self.symbol_table = symbol_table or create_default_symbol_table()
+        self.semantic_analyzer = SemanticAnalyzer(self.symbol_table)
+        self.vm = VirtualMachine()
 
     def compile(self, text: str) -> str:
         sql, _, _ = self._run_pipeline(text)
@@ -2097,11 +3098,45 @@ class NLToSQLCompiler:
         enhanced_text, recommendations = self.recommender.enhance(text)
         tokens = NLLexer(enhanced_text).tokenize()
         nl_ast = LL1Parser(tokens).parse()
+
+        # Semantic mapping -> DSL spec
         dsl_spec = self.mapper.map(nl_ast)
-        dsl_script = self.dsl_builder.build(dsl_spec)
+
+        # Convert DSL spec to IR and optimize
+        ir = self._dsl_spec_to_ir(dsl_spec)
+        self._optimize_ir(ir)
+
+        # Render DSL script from optimized IR and parse to SQL AST
+        dsl_script = self.dsl_builder.build(ir)
         sql_ast = self.dsl_parser.parse(dsl_script)
-        sql = self.generator.generate(sql_ast)
-        
+
+        # Perform semantic analysis
+        annotated_ast = None
+        semantic_errors: List[SemanticError] = []
+        sql = ""
+        vm_output: Optional[str] = None
+
+        try:
+            annotated_ast = self.semantic_analyzer.analyze(sql_ast)
+            sql = self.generator.generate(sql_ast)
+        except SemanticError as e:
+            semantic_errors.append(e)
+            try:
+                sql = self.generator.generate(sql_ast)
+            except Exception:
+                sql = "-- SQL generation failed due to semantic errors"
+        except Exception as e:
+            semantic_errors.append(SemanticError(f"Semantic analysis failed: {str(e)}"))
+            try:
+                sql = self.generator.generate(sql_ast)
+            except Exception:
+                sql = "-- SQL generation failed"
+        # VM execution phase (conceptual execution trace only)
+        try:
+            vm_output = self.vm.execute(sql_ast)
+        except Exception as e:
+            vm_output = f"VM execution simulation failed: {str(e)}"
+
         return CompilerDebugInfo(
             original_text=text,
             enhanced_text=enhanced_text,
@@ -2110,8 +3145,11 @@ class NLToSQLCompiler:
             dsl_spec=dsl_spec,
             dsl_script=dsl_script,
             sql_ast=sql_ast,
+            annotated_ast=annotated_ast,
+            semantic_errors=semantic_errors,
             sql=sql,
-            recommendations=recommendations
+            recommendations=recommendations,
+            vm_output=vm_output,
         )
 
     def _run_pipeline(self, text: str) -> Tuple[str, str, List[str]]:
@@ -2119,8 +3157,21 @@ class NLToSQLCompiler:
         tokens = NLLexer(enhanced_text).tokenize()
         statement = LL1Parser(tokens).parse()
         interpretation = self.mapper.map(statement)
-        dsl_script = self.dsl_builder.build(interpretation)
+
+        # Convert interpretation (DSL spec) to IR and optimize
+        ir = self._dsl_spec_to_ir(interpretation)
+        self._optimize_ir(ir)
+
+        # Build DSL script from optimized IR and parse
+        dsl_script = self.dsl_builder.build(ir)
         reconstructed_ast = self.dsl_parser.parse(dsl_script)
+
+        # Perform semantic analysis (but don't fail on errors, just validate)
+        try:
+            self.semantic_analyzer.analyze(reconstructed_ast)
+        except SemanticError:
+            pass
+
         sql = self.generator.generate(reconstructed_ast)
         return sql, dsl_script, recommendations
 
@@ -2131,6 +3182,77 @@ class NLToSQLCompiler:
             vocabulary.update(mapping.values())
         vocabulary.update({"record", "records", "table", "tables"})
         return vocabulary
+
+    # --- DSL -> IR conversion and optimization passes -----------------
+    def _dsl_spec_to_ir(self, spec: DSLStatementSpec) -> IRStatement:
+        if isinstance(spec, DSLSelectSpec):
+            conditions = [IRCondition(column=c.column, operator=c.operator, literal=c.literal, connector=c.connector) for c in spec.conditions]
+            projections = list(spec.columns)
+            ir = IRSelect(
+                projections=projections,
+                table=spec.table,
+                conditions=conditions,
+                distinct=spec.distinct,
+                order_clauses=list(spec.order_clauses),
+                limit=spec.limit,
+                offset=spec.offset,
+            )
+            return ir
+
+        if isinstance(spec, DSLInsertSpec):
+            return IRInsert(table=spec.table, columns=list(spec.columns), values=list(spec.values))
+
+        if isinstance(spec, DSLDeleteSpec):
+            conditions = [IRCondition(column=c.column, operator=c.operator, literal=c.literal, connector=c.connector) for c in spec.conditions]
+            return IRDelete(table=spec.table, conditions=conditions)
+
+        if isinstance(spec, DSLUpdateSpec):
+            conditions = [IRCondition(column=c.column, operator=c.operator, literal=c.literal, connector=c.connector) for c in spec.conditions]
+            return IRUpdate(table=spec.table, assignments=list(spec.assignments), conditions=conditions)
+
+        raise TypeError("IR conversion not implemented for this DSL statement type")
+
+    def _optimize_ir(self, ir: IRStatement) -> None:
+        """Run a set of simple optimization passes on the IR in-place.
+
+        Passes implemented:
+        - predicate simplification: remove duplicate conditions
+        - projection pruning (conservative): remove duplicate projections
+        - ORDER+LIMIT pushdown hinting: add hint if both present
+        """
+        if isinstance(ir, IRSelect):
+            # Predicate simplification: remove exact duplicate conditions
+            seen_cond: Set[Tuple[str, str, str, Optional[str]]] = set()
+            new_conds: List[IRCondition] = []
+            for c in ir.conditions:
+                key = (c.column.lower(), c.operator, c.literal, c.connector)
+                if key in seen_cond:
+                    continue
+                seen_cond.add(key)
+                new_conds.append(c)
+            ir.conditions = new_conds
+
+            # Projection pruning (conservative): remove duplicate projections preserving order
+            seen_proj: Set[str] = set()
+            new_projs: List[str] = []
+            for p in ir.projections:
+                if p == '*':
+                    new_projs = ['*']
+                    break
+                low = p.lower()
+                if low in seen_proj:
+                    continue
+                seen_proj.add(low)
+                new_projs.append(p)
+            ir.projections = new_projs
+
+            # ORDER+LIMIT pushdown: annotate IR with a hint (no structural change here)
+            if ir.limit is not None and ir.order_clauses:
+                try:
+                    ir.hints = getattr(ir, 'hints', {})
+                    ir.hints['order_limit_pushdown'] = True
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -2186,6 +3308,13 @@ def format_nl_ast(ast: NLStatement) -> str:
     return json.dumps(ast_dict, indent=2)
 
 
+# format_ast_tree removed — textual AST tree rendering disabled in UI
+
+
+def nl_ast_to_dot(ast: NLStatement) -> str:
+    raise RuntimeError("NL DOT representation removed; use nl_ast_to_graphviz_source instead.")
+
+
 def format_sql_ast(ast: SQLStatement) -> str:
     """Format SQL AST for display."""
     import json
@@ -2225,6 +3354,169 @@ def format_sql_ast(ast: SQLStatement) -> str:
     return json.dumps(ast_dict, indent=2)
 
 
+def sql_ast_to_dot(ast: SQLStatement) -> str:
+    raise RuntimeError("SQL DOT representation removed; use sql_ast_to_graphviz_source instead.")
+
+
+def nl_ast_to_graphviz_source(ast: NLStatement) -> str:
+    """Build a Graphviz Digraph source programmatically from the NL AST (JSON-first).
+
+    Falls back to a single-node DOT if JSON conversion fails.
+    """
+    try:
+        from graphviz import Digraph
+    except Exception:
+        raise
+
+    import json
+
+    from dataclasses import is_dataclass, fields
+
+    def _ast_to_plain(obj: Any) -> Any:
+        if obj is None:
+            return None
+        if is_dataclass(obj):
+            result: Dict[str, Any] = {"type": obj.__class__.__name__}
+            for f in fields(obj):
+                v = getattr(obj, f.name)
+                if v is None:
+                    continue
+                result[f.name] = _ast_to_plain(v)
+            return result
+        if isinstance(obj, dict):
+            return {k: _ast_to_plain(v) for k, v in obj.items() if v is not None}
+        if isinstance(obj, (list, tuple)):
+            return [_ast_to_plain(v) for v in obj]
+        if hasattr(obj, "__dict__"):
+            result = {"type": obj.__class__.__name__}
+            for k, v in vars(obj).items():
+                if v is None:
+                    continue
+                result[k] = _ast_to_plain(v)
+            return result
+        return obj
+
+    try:
+        parsed = _ast_to_plain(ast)
+    except Exception:
+        # fallback to simple single-node graph
+        d = Digraph("NL_AST", node_attr={"shape": "box"})
+        d.node("n1", label=str(ast))
+        return d.source
+
+    d = Digraph("NL_AST", node_attr={"shape": "box", "style": "rounded"})
+    counter = 0
+
+    def next_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"n{counter}"
+
+    def add(obj) -> str:
+        nid = next_id()
+        if isinstance(obj, dict):
+            label = obj.get('type', 'obj')
+            d.node(nid, label=label)
+            for k, v in obj.items():
+                if k == 'type':
+                    continue
+                kid = next_id()
+                d.node(kid, label=str(k))
+                d.edge(nid, kid)
+                child_id = add(v)
+                d.edge(kid, child_id)
+            return nid
+        if isinstance(obj, list):
+            d.node(nid, label='list')
+            for item in obj:
+                child = add(item)
+                d.edge(nid, child)
+            return nid
+        # primitive
+        d.node(nid, label=str(obj))
+        return nid
+
+    add(parsed)
+    return d.source
+
+
+def sql_ast_to_graphviz_source(ast: SQLStatement) -> str:
+    """Build a Graphviz Digraph source programmatically from the SQL AST (JSON-first)."""
+    try:
+        from graphviz import Digraph
+    except Exception:
+        raise
+
+    import json
+
+    from dataclasses import is_dataclass, fields
+
+    def _ast_to_plain(obj: Any) -> Any:
+        if obj is None:
+            return None
+        if is_dataclass(obj):
+            result: Dict[str, Any] = {"type": obj.__class__.__name__}
+            for f in fields(obj):
+                v = getattr(obj, f.name)
+                if v is None:
+                    continue
+                result[f.name] = _ast_to_plain(v)
+            return result
+        if isinstance(obj, dict):
+            return {k: _ast_to_plain(v) for k, v in obj.items() if v is not None}
+        if isinstance(obj, (list, tuple)):
+            return [_ast_to_plain(v) for v in obj]
+        if hasattr(obj, "__dict__"):
+            result = {"type": obj.__class__.__name__}
+            for k, v in vars(obj).items():
+                if v is None:
+                    continue
+                result[k] = _ast_to_plain(v)
+            return result
+        return obj
+
+    try:
+        parsed = _ast_to_plain(ast)
+    except Exception:
+        d = Digraph("SQL_AST", node_attr={"shape": "box"})
+        d.node("s1", label=str(ast))
+        return d.source
+
+    d = Digraph("SQL_AST", node_attr={"shape": "box", "style": "rounded"})
+    counter = 0
+
+    def next_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"s{counter}"
+
+    def add(obj) -> str:
+        nid = next_id()
+        if isinstance(obj, dict):
+            label = obj.get('type', 'obj')
+            d.node(nid, label=label)
+            for k, v in obj.items():
+                if k == 'type':
+                    continue
+                kid = next_id()
+                d.node(kid, label=str(k))
+                d.edge(nid, kid)
+                child_id = add(v)
+                d.edge(kid, child_id)
+            return nid
+        if isinstance(obj, list):
+            d.node(nid, label='list')
+            for item in obj:
+                child = add(item)
+                d.edge(nid, child)
+            return nid
+        d.node(nid, label=str(obj))
+        return nid
+
+    add(parsed)
+    return d.source
+
+
 def format_dsl_spec(spec: DSLStatementSpec) -> str:
     """Format DSL spec for display."""
     import json
@@ -2250,6 +3542,257 @@ def format_dsl_spec(spec: DSLStatementSpec) -> str:
     
     spec_dict = spec_to_dict(spec)
     return json.dumps(spec_dict, indent=2)
+
+
+def format_annotated_ast(ast: Optional[AnnotatedStatement]) -> str:
+    """Format annotated AST for display."""
+    import json
+    from dataclasses import asdict
+    
+    if ast is None:
+        return "No annotated AST available"
+    
+    def annotated_to_dict(obj):
+        """Convert annotated AST to dictionary."""
+        if isinstance(obj, (AnnotatedSelect, AnnotatedInsert, AnnotatedDelete, AnnotatedUpdate)):
+            result = {
+                "type": obj.__class__.__name__,
+            }
+            for key, value in asdict(obj).items():
+                if value is None:
+                    continue
+                if isinstance(value, AnnotatedColumn):
+                    result[key] = {
+                        "name": value.name,
+                        "source_table": value.source_table,
+                        "data_type": value.data_type,
+                        "nullable": value.column_info.nullable if value.column_info else None
+                    }
+                elif isinstance(value, list) and value:
+                    if isinstance(value[0], AnnotatedColumn):
+                        result[key] = [
+                            {
+                                "name": col.name,
+                                "source_table": col.source_table,
+                                "data_type": col.data_type
+                            }
+                            for col in value
+                        ]
+                    elif isinstance(value[0], tuple) and len(value[0]) == 2 and isinstance(value[0][0], AnnotatedColumn):
+                        result[key] = [
+                            {
+                                "column": {
+                                    "name": col.name,
+                                    "source_table": col.source_table,
+                                    "data_type": col.data_type
+                                },
+                                "is_desc": is_desc
+                            }
+                            for col, is_desc in value
+                        ]
+                    elif isinstance(value[0], tuple) and len(value[0]) == 2:
+                        result[key] = [
+                            {
+                                "column": {
+                                    "name": col.name,
+                                    "source_table": col.source_table,
+                                    "data_type": col.data_type
+                                } if isinstance(col, AnnotatedColumn) else col,
+                                "value": val
+                            }
+                            for col, val in value
+                        ]
+                    else:
+                        result[key] = value
+                elif isinstance(value, AnnotatedCondition):
+                    result[key] = format_annotated_condition(value)
+                elif isinstance(value, TableInfo):
+                    result[key] = {
+                        "name": value.name,
+                        "columns": list(value.columns.keys())
+                    }
+                else:
+                    result[key] = value
+            return result
+        return str(obj)
+    
+    def format_annotated_condition(cond: AnnotatedCondition) -> dict:
+        """Format annotated condition recursively."""
+        result = {
+            "left": {
+                "name": cond.left.name,
+                "source_table": cond.left.source_table,
+                "data_type": cond.left.data_type
+            },
+            "operator": cond.operator,
+            "right": cond.right,
+            "right_type": cond.right_type,
+            "connector": cond.connector
+        }
+        if cond.next_condition:
+            result["next"] = format_annotated_condition(cond.next_condition)
+        return result
+    
+    ast_dict = annotated_to_dict(ast)
+    return json.dumps(ast_dict, indent=2)
+
+
+def annotated_ast_to_dot(ast: Optional[AnnotatedStatement]) -> str:
+    """Convert Annotated AST to DOT format for Graphviz by traversing dataclass/object structure."""
+    from dataclasses import is_dataclass, fields
+
+    def _ast_to_plain(obj: Any) -> Any:
+        if obj is None:
+            return None
+        if is_dataclass(obj):
+            result: Dict[str, Any] = {"type": obj.__class__.__name__}
+            for f in fields(obj):
+                v = getattr(obj, f.name)
+                if v is None:
+                    continue
+                result[f.name] = _ast_to_plain(v)
+            return result
+        if isinstance(obj, dict):
+            return {k: _ast_to_plain(v) for k, v in obj.items() if v is not None}
+        if isinstance(obj, (list, tuple)):
+            return [_ast_to_plain(v) for v in obj]
+        if hasattr(obj, "__dict__"):
+            result = {"type": obj.__class__.__name__}
+            for k, v in vars(obj).items():
+                if v is None:
+                    continue
+                result[k] = _ast_to_plain(v)
+            return result
+        return obj
+
+    try:
+        parsed = _ast_to_plain(ast)
+    except Exception:
+        lines = ["digraph Annotated_AST {", "  node [shape=box, fontname=Helvetica]"]
+        safe = str(ast).replace('"', '\\"')
+        lines.append(f'  a1 [label="{safe}"]')
+        lines.append('}')
+        return "\n".join(lines)
+
+    def dict_to_dot(obj: Any, lines: List[str], parent: Optional[str], counter: List[int]) -> str:
+        counter[0] += 1
+        nid = f"a{counter[0]}"
+        if isinstance(obj, dict):
+            label = obj.get('type', 'obj')
+            safe = str(label).replace('"', '\\"')
+            lines.append(f'  {nid} [label="{safe}"]')
+            if parent:
+                lines.append(f"  {parent} -> {nid}")
+            for k, v in obj.items():
+                if k == 'type':
+                    continue
+                counter[0] += 1
+                kid = f"a{counter[0]}"
+                ksafe = str(k).replace('"', '\\"')
+                lines.append(f'  {kid} [label="{ksafe}"]')
+                lines.append(f"  {nid} -> {kid}")
+                if isinstance(v, (dict, list)):
+                    dict_to_dot(v, lines, kid, counter)
+                else:
+                    counter[0] += 1
+                    leaf = f"a{counter[0]}"
+                    vsafe = str(v).replace('"', '\\"')
+                    lines.append(f'  {leaf} [label="{vsafe}"]')
+                    lines.append(f"  {kid} -> {leaf}")
+            return nid
+        if isinstance(obj, list):
+            label = 'list'
+            lines.append(f'  {nid} [label="{label}"]')
+            if parent:
+                lines.append(f"  {parent} -> {nid}")
+            for item in obj:
+                dict_to_dot(item, lines, nid, counter)
+            return nid
+        safe = str(obj).replace('"', '\\"')
+        lines.append(f'  {nid} [label="{safe}"]')
+        if parent:
+            lines.append(f"  {parent} -> {nid}")
+        return nid
+
+    lines: List[str] = ["digraph Annotated_AST {", "  node [shape=box, fontname=Helvetica]"]
+    dict_to_dot(parsed, lines, None, [0])
+    lines.append('}')
+    return "\n".join(lines)
+
+
+def annotated_ast_to_graphviz_source(ast: Optional[AnnotatedStatement]) -> str:
+    """Build a Graphviz Digraph source programmatically from an annotated AST."""
+    try:
+        from graphviz import Digraph
+    except Exception:
+        raise
+
+    from dataclasses import is_dataclass, fields
+
+    def _ast_to_plain(obj: Any) -> Any:
+        if obj is None:
+            return None
+        if is_dataclass(obj):
+            result: Dict[str, Any] = {"type": obj.__class__.__name__}
+            for f in fields(obj):
+                v = getattr(obj, f.name)
+                if v is None:
+                    continue
+                result[f.name] = _ast_to_plain(v)
+            return result
+        if isinstance(obj, dict):
+            return {k: _ast_to_plain(v) for k, v in obj.items() if v is not None}
+        if isinstance(obj, (list, tuple)):
+            return [_ast_to_plain(v) for v in obj]
+        if hasattr(obj, "__dict__"):
+            result = {"type": obj.__class__.__name__}
+            for k, v in vars(obj).items():
+                if v is None:
+                    continue
+                result[k] = _ast_to_plain(v)
+            return result
+        return obj
+
+    try:
+        parsed = _ast_to_plain(ast)
+    except Exception:
+        d = Digraph("Annotated_AST", node_attr={"shape": "box"})
+        d.node("a1", label=str(ast))
+        return d.source
+
+    d = Digraph("Annotated_AST", node_attr={"shape": "box", "style": "rounded"})
+    counter = 0
+
+    def next_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"a{counter}"
+
+    def add(obj) -> str:
+        nid = next_id()
+        if isinstance(obj, dict):
+            label = obj.get('type', 'obj')
+            d.node(nid, label=label)
+            for k, v in obj.items():
+                if k == 'type':
+                    continue
+                kid = next_id()
+                d.node(kid, label=str(k))
+                d.edge(nid, kid)
+                child_id = add(v)
+                d.edge(kid, child_id)
+            return nid
+        if isinstance(obj, list):
+            d.node(nid, label='list')
+            for item in obj:
+                child = add(item)
+                d.edge(nid, child)
+            return nid
+        d.node(nid, label=str(obj))
+        return nid
+
+    add(parsed)
+    return d.source
 
 
 def get_grammar_info() -> str:
@@ -2280,9 +3823,13 @@ def main() -> None:
         initial_sidebar_state="expanded"
     )
     
-    # Initialize compiler
+    # Initialize compiler with schema management
     if 'compiler' not in st.session_state:
         st.session_state.compiler = NLToSQLCompiler()
+    if 'schema_loaded' not in st.session_state:
+        st.session_state.schema_loaded = False
+    if 'schema_json' not in st.session_state:
+        st.session_state.schema_json = None
     
     compiler = st.session_state.compiler
     
@@ -2292,6 +3839,149 @@ def main() -> None:
     
     # Sidebar with instructions and examples
     with st.sidebar:
+        st.header("🗄️ Schema Management")
+        
+        # Schema upload section
+        with st.expander("📤 Load Schema from JSON", expanded=False):
+            uploaded_file = st.file_uploader(
+                "Upload Schema JSON File",
+                type=['json'],
+                help="Upload a JSON file defining your database schema"
+            )
+            
+            if uploaded_file is not None:
+                try:
+                    content_bytes = uploaded_file.getvalue()
+                    current_hash = hashlib.sha256(content_bytes).hexdigest()
+                    if st.session_state.get('last_uploaded_hash') != current_hash:
+                        json_content = content_bytes.decode('utf-8')
+                        schema = load_schema_from_json(json_content)
+                        st.session_state.compiler = NLToSQLCompiler(symbol_table=schema)
+                        st.session_state.schema_loaded = True
+                        st.session_state.schema_json = json_content
+                        st.session_state.last_uploaded_hash = current_hash
+                        st.success(f"✅ Schema loaded successfully! ({len(schema.get_all_tables())} tables)")
+                except Exception as e:
+                    st.error(f"❌ Error loading schema: {str(e)}")
+            
+            st.markdown("---")
+            
+                        # (Schema format example and download removed)
+            
+            # Reset to default (load the hardcoded schema inside the code)
+            if st.button("🔄 Reset to Default Schema", width='stretch', key="reset_schema_btn"):
+                default_symtab = create_default_symbol_table()
+                st.session_state.compiler = NLToSQLCompiler(symbol_table=default_symtab)
+                st.session_state.schema_loaded = True
+                try:
+                    st.session_state.schema_json = export_schema_to_json(default_symtab)
+                except Exception:
+                    st.session_state.schema_json = None
+                # Prevent an existing uploaded file from immediately reloading
+                try:
+                    if uploaded_file is not None:
+                        uploaded_bytes = uploaded_file.getvalue()
+                        st.session_state.last_uploaded_hash = hashlib.sha256(uploaded_bytes).hexdigest()
+                except Exception:
+                    st.session_state.last_uploaded_hash = st.session_state.get('last_uploaded_hash')
+
+                st.success("✅ Reset to hardcoded default schema")
+                st.rerun()
+        
+        # Re-read compiler from session state in case it was updated above
+        compiler = st.session_state.compiler
+
+        # Show current schema info
+        if st.session_state.schema_loaded:
+            st.info(f"📊 Custom schema loaded ({len(compiler.symbol_table.get_all_tables())} tables)")
+        else:
+            st.info("📊 Using default schema")
+        
+        st.markdown("---")
+        
+        # Live Database Schema View
+        with st.expander("📋 Database Schema View", expanded=True):
+            symtab = compiler.symbol_table
+            all_tables = symtab.get_all_tables()
+            
+            if not all_tables:
+                st.warning("No tables found in schema")
+            else:
+                # Summary statistics
+                total_columns = sum(
+                    len(symtab.get_table(table).columns) if symtab.get_table(table) else 0
+                    for table in all_tables
+                )
+                
+                # Summary removed: counters hidden as requested
+                
+                
+                # Display each table in a card-like format
+                for idx, table_name in enumerate(sorted(all_tables)):
+                    table_info = symtab.get_table(table_name)
+                    if not table_info:
+                        continue
+                    
+                    # Table header with expander
+                    with st.expander(
+                        f"📑 **{table_info.name}** - {len(table_info.columns)} column(s)",
+                        expanded=False
+                    ):
+                        # Table info badge
+                        st.markdown(f"**Table Name:** `{table_info.name}`")
+                        
+                        # Display columns in a nice table
+                        try:
+                            import pandas as pd
+                            # Create DataFrame for better display
+                            columns_list = []
+                            for col_name, col_info in sorted(table_info.columns.items()):
+                                nullable_status = "✅ Yes" if col_info.nullable else "❌ No"
+                                columns_list.append({
+                                    "Column": col_info.name,
+                                    "Type": col_info.data_type,
+                                    "Nullable": nullable_status
+                                })
+                            
+                            df = pd.DataFrame(columns_list)
+                            st.dataframe(
+                                df,
+                                width='stretch',
+                                hide_index=True
+                            )
+                        except ImportError:
+                            # Fallback: Use markdown table
+                            st.markdown("**Columns:**")
+                            table_md = "| Column | Type | Nullable |\n"
+                            table_md += "|--------|------|----------|\n"
+                            for col_name, col_info in sorted(table_info.columns.items()):
+                                nullable_text = "Yes" if col_info.nullable else "No"
+                                table_md += f"| `{col_info.name}` | `{col_info.data_type}` | {nullable_text} |\n"
+                            st.markdown(table_md)
+                        
+                        # Show primary key candidates (columns with NOT NULL that look like IDs)
+                        pk_candidates = [
+                            col_info.name for col_name, col_info in table_info.columns.items()
+                            if not col_info.nullable and (
+                                col_info.name.lower().endswith('_id') or
+                                col_info.name.lower() == 'id' or
+                                col_info.name.lower().endswith('id')
+                            )
+                        ]
+                        if pk_candidates:
+                            st.caption(f"🔑 Potential Primary Keys: {', '.join([f'`{pk}`' for pk in pk_candidates])}")
+                        
+                        # Show metadata if available
+                        if table_info.metadata and table_info.metadata != {}:
+                            with st.expander("📝 Table Metadata", expanded=False):
+                                st.json(table_info.metadata)
+                    
+                    # Add separator between tables (except last one)
+                    if idx < len(all_tables) - 1:
+                        st.markdown("<hr style='margin: 0.5rem 0;'>", unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
         st.header("📖 Available SQL Syntax")
         st.markdown("""
         - **SELECT**: Get data from tables
@@ -2329,9 +4019,9 @@ def main() -> None:
     # Buttons
     col1, col2, col3 = st.columns([1, 1, 6])
     with col1:
-        compile_button = st.button("🚀 Compile", type="primary", use_container_width=True)
+        compile_button = st.button("🚀 Compile", type="primary", width='stretch')
     with col2:
-        clear_button = st.button("🗑️ Clear", use_container_width=True)
+        clear_button = st.button("🗑️ Clear", width='stretch')
     
     # Handle clear button click - must be before widget creation
     if clear_button:
@@ -2388,18 +4078,29 @@ def main() -> None:
         with st.expander("🔷 DSL (Intermediate Representation)", expanded=False):
             st.code(artifacts.dsl, language="text")
         
+        # Semantic errors (if any) - show prominently
+        if 'debug_info' in st.session_state and st.session_state.debug_info:
+            debug_info = st.session_state.debug_info
+            if debug_info.semantic_errors:
+                st.error(f"⚠️ **Semantic Errors Detected** ({len(debug_info.semantic_errors)})")
+                with st.expander("View Semantic Errors", expanded=True):
+                    for i, error in enumerate(debug_info.semantic_errors, 1):
+                        error_type = error.__class__.__name__
+                        st.error(f"**{i}. {error_type}**")
+                        st.code(str(error), language="text")
+                st.markdown("---")
+        
         # SQL output (expanded by default)
         st.header("💾 Generated SQL")
         st.code(artifacts.sql, language="sql")
         
-        # Recommendations (collapsible)
+        # Recommendations (always shown)
+        st.markdown("**💡 Recommendations**")
         if artifacts.recommendations:
-            with st.expander("💡 Recommendations", expanded=False):
-                for rec in artifacts.recommendations:
-                    st.info(rec)
+            for rec in artifacts.recommendations:
+                st.info(rec)
         else:
-            with st.expander("💡 Recommendations", expanded=False):
-                st.success("No recommendations. Query processed successfully!")
+            st.success("No recommendations. Query processed successfully!")
         
         # Debug/Compiler Phases Section
         st.markdown("---")
@@ -2408,9 +4109,10 @@ def main() -> None:
                 debug_info = st.session_state.debug_info
                 
                 # Create tabs for different phases
-                tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
                     "📝 Input/Output", "🔤 Tokens", "🌳 NL AST", 
-                    "🔷 DSL Spec", "🌲 SQL AST", "📚 Grammar", "📊 Parser Info"
+                    "🔷 DSL Spec", "🌲 SQL AST", "🔍 Semantic Analysis", "📚 Grammar", "📊 Parser Info",
+                    "🧮 VM Execution"
                 ])
                 
                 with tab1:
@@ -2444,8 +4146,14 @@ Phase 4: DSL Generation
 Phase 5: DSL Parsing (LALR)
   - SQL AST Type: {debug_info.sql_ast.__class__.__name__}
 
-Phase 6: Code Generation
+Phase 6: Semantic Analysis
+    - Semantic Errors: {len(debug_info.semantic_errors) if debug_info.semantic_errors else 0}
+
+Phase 7: Code Generation
   - SQL Generated: {debug_info.sql}
+
+Phase 8: Virtual Machine Execution
+  - VM Trace (summary): {'available' if debug_info.vm_output else 'not available'}
 
 Recommendations: {len(debug_info.recommendations)} suggestion(s)
 """
@@ -2468,9 +4176,15 @@ Recommendations: {len(debug_info.recommendations)} suggestion(s)
                 
                 with tab3:
                     st.subheader("Natural Language AST (LL(1) Parser Output)")
-                    st.markdown("**Abstract Syntax Tree:**")
+                    st.markdown("**Abstract Syntax Tree (JSON):**")
                     nl_ast_formatted = format_nl_ast(debug_info.nl_ast)
                     st.code(nl_ast_formatted, language="json")
+
+                    try:
+                        dot_src = nl_ast_to_graphviz_source(debug_info.nl_ast)
+                        st.graphviz_chart(dot_src)
+                    except Exception:
+                        pass
                     
                     st.markdown("**AST Type:**")
                     st.info(f"{debug_info.nl_ast.__class__.__name__}")
@@ -2486,14 +4200,46 @@ Recommendations: {len(debug_info.recommendations)} suggestion(s)
                 
                 with tab5:
                     st.subheader("SQL AST (LALR Parser Output)")
-                    st.markdown("**SQL Abstract Syntax Tree:**")
+                    st.markdown("**SQL Abstract Syntax Tree (JSON):**")
                     sql_ast_formatted = format_sql_ast(debug_info.sql_ast)
                     st.code(sql_ast_formatted, language="json")
+
+                    try:
+                        dot_src = sql_ast_to_graphviz_source(debug_info.sql_ast)
+                        st.graphviz_chart(dot_src)
+                    except Exception:
+                        pass
                     
                     st.markdown("**AST Type:**")
                     st.info(f"{debug_info.sql_ast.__class__.__name__}")
                 
                 with tab6:
+                    st.subheader("Semantic Analysis")
+                    
+                    # Display semantic errors if any
+                    if debug_info.semantic_errors:
+                        st.error(f"⚠️ Found {len(debug_info.semantic_errors)} semantic error(s):")
+                        for i, error in enumerate(debug_info.semantic_errors, 1):
+                            error_type = error.__class__.__name__
+                            st.error(f"**{i}. {error_type}**")
+                            st.code(str(error), language="text")
+                    else:
+                        st.success("✅ No semantic errors found!")
+                    
+                    st.markdown("---")
+                    
+                    # Show symbol table information
+                    st.subheader("Symbol Table Information")
+                    compiler = st.session_state.compiler
+                    symtab = compiler.symbol_table
+                    tables = symtab.get_all_tables()
+                    st.info(f"**Registered Tables**: {len(tables)}")
+                    for table_name in sorted(tables):
+                        table_info = symtab.get_table(table_name)
+                        if table_info:
+                            st.text(f"  • {table_info.name}: {len(table_info.columns)} columns")
+                
+                with tab7:
                     st.subheader("Grammar Information")
                     grammar_info = get_grammar_info()
                     st.code(grammar_info, language="text")
@@ -2511,7 +4257,7 @@ Recommendations: {len(debug_info.recommendations)} suggestion(s)
                       - Handles left recursion and ambiguity
                     """)
                 
-                with tab7:
+                with tab8:
                     st.subheader("Parser Information")
                     
                     st.markdown("**LL(1) Parser Details:**")
@@ -2540,7 +4286,51 @@ Recommendations: {len(debug_info.recommendations)} suggestion(s)
                     4. **DSL Generation**: Converts DSL spec to DSL script
                     5. **DSL Parsing (LALR)**: Parses DSL script to SQL AST
                     6. **Code Generation**: Converts SQL AST to SQL string
+                    7. **Virtual Machine Execution**: Simulates how the SQL statement would be executed
                     """)
+                
+                with tab9:
+                    st.subheader("Virtual Machine Execution (Conceptual)")
+                    st.markdown(
+                        """
+                        This virtual machine does not operate on real data; it represents the logical execution stages of the generated SQL.
+                        The VM trace corresponds directly to the generated SQL statement and mirrors the execution stages performed internally by the database engine.
+                        This execution trace represents the backend execution semantics of the compiler after SQL code generation (IR / Execution semantics / Backend).
+                        """
+                    )
+                    if getattr(debug_info, "vm_output", None):
+                        st.markdown("**VM Execution Trace:**")
+                        st.code(debug_info.vm_output, language="text")
+                        try:
+                            import re
+                            sql_text = getattr(debug_info, 'sql', '') or ''
+                            table_name = None
+                            m = re.search(r'from\s+([A-Za-z0-9_]+)', sql_text, re.IGNORECASE)
+                            if m:
+                                table_name = m.group(1)
+
+                            cols = '*'
+                            m2 = re.search(r'select\s+(.*?)\s+from', sql_text, re.IGNORECASE | re.DOTALL)
+                            if m2:
+                                cols = m2.group(1).strip()
+
+                            order_clause = ''
+                            m3 = re.search(r'order\s+by\s+(.+?)(?:\s+limit\b|$)', sql_text, re.IGNORECASE | re.DOTALL)
+                            if m3:
+                                order_clause = m3.group(1).strip()
+
+                            result_lines = []
+                            result_lines.append('VM: RESULT')
+                            if table_name:
+                                result_lines.append(f'  - Relation over table: {table_name}')
+                            result_lines.append(f'  - Columns returned   : {cols}')
+                            if order_clause:
+                                result_lines.append(f'  - Ordering applied   : {order_clause}')
+                            st.code('\n'.join(result_lines), language='text')
+                        except Exception:
+                            pass
+                    else:
+                        st.info("VM execution trace is not available for this query.")
             else:
                 st.info("Debug information not available. Please compile a query first.")
 
