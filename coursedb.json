@@ -1,0 +1,89 @@
+{
+    "database": "courses",
+    "tables": [
+        {
+            "name": "Students",
+            "columns": [
+                {
+                    "name": "student_id",
+                    "data_type": "INTEGER",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "student_name",
+                    "data_type": "VARCHAR",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "email",
+                    "data_type": "VARCHAR",
+                    "nullable": true,
+                    "metadata": {}
+                },
+                {
+                    "name": "gpa",
+                    "data_type": "DECIMAL",
+                    "nullable": true,
+                    "metadata": {}
+                }
+            ],
+            "metadata": {}
+        },
+        {
+            "name": "Courses",
+            "columns": [
+                {
+                    "name": "course_id",
+                    "data_type": "INTEGER",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "course_name",
+                    "data_type": "VARCHAR",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "credits",
+                    "data_type": "INTEGER",
+                    "nullable": true,
+                    "metadata": {}
+                }
+            ],
+            "metadata": {}
+        },
+        {
+            "name": "Enrollments",
+            "columns": [
+                {
+                    "name": "enrollment_id",
+                    "data_type": "INTEGER",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "student_id",
+                    "data_type": "INTEGER",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "course_id",
+                    "data_type": "INTEGER",
+                    "nullable": false,
+                    "metadata": {}
+                },
+                {
+                    "name": "enrolled_date",
+                    "data_type": "DATE",
+                    "nullable": true,
+                    "metadata": {}
+                }
+            ],
+            "metadata": {}
+        }
+    ]
+}
