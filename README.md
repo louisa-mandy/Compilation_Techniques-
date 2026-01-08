@@ -28,7 +28,7 @@ This modular design ensures robustness, debuggability, and ease of extension.
 
 ### Prerequisites
 - **Python 3.8+** (tested on 3.13).
-- **Streamlit** (install via `pip install streamlit` or use the provided `requirements.txt`).
+- **Streamlit** (install via `pip install streamlit`)
 
 ### Steps
 1. Clone or download the repository to your local machine.
