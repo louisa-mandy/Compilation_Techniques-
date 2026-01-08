@@ -32,8 +32,9 @@ This modular design ensures robustness, debuggability, and ease of extension.
 
 ### Steps
 1. Clone or download the repository to your local machine.
-2. Open a terminal and navigate to the project folder: `cd Final_project`.
-3. Run the Streamlit app: `streamlit run CompTech.py`
+2. pip install graphviz
+3. Open a terminal and navigate to the project folder: `cd Final_project`.
+4. Run the Streamlit app: `streamlit run CompTech.py`
 
 The Streamlit web interface will open automatically in your default browser at `http://localhost:8501`. If it doesn't open automatically, navigate to that URL manually.
 
